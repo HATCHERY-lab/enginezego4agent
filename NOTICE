@@ -1,0 +1,14 @@
+engine4agent
+Copyright (c) 2026 ZENG3LD. Licensed under the MIT License (see LICENSE).
+
+This product includes software derived from pi-durable 1.5.0
+(@earendil-works/pi-durable, https://github.com/earendil-works/pi,
+packages/durable, tag v1.5.0, commit f9a26365568127461c47a07a37dcb42c140a3ac5),
+and may include code from pi-env (packages/env/daemon) of the same repository.
+Copyright (c) 2025 Mario Zechner. Developed by Earendil Works
+(Mario Zechner, Armin Ronacher). Licensed under the MIT License;
+the full license text is in LICENSES/pi-MIT.txt.
+
+Source files ported closely from upstream carry the header:
+  // Portions derived from pi-durable 1.5.0 (packages/durable/src/<file>), MIT,
+  // © 2025 Mario Zechner / Earendil Works. See LICENSES/pi-MIT.txt.
