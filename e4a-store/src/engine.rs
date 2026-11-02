@@ -66,6 +66,35 @@ impl RecordType {
     }
 }
 
+/// One document row the batch inserted or updated, plus the revision rows to write.
+#[derive(Debug)]
+pub(crate) struct DocumentWrite {
+    pub inserted: bool,
+    pub record: DocumentRecord,
+    /// Delete stored revision rows before inserting `revisions`.
+    pub replace_revisions: bool,
+    pub revisions: Vec<Revision>,
+}
+
+/// Rows one accepted batch inserts or updates. Rows the batch did not touch are absent.
+#[derive(Debug)]
+pub(crate) struct BatchWrite {
+    pub seq: i64,
+    pub conversations: Vec<ConversationRecord>,
+    pub entries: Vec<EntryRecord>,
+    pub tasks: Vec<TaskRecord>,
+    pub submissions: Vec<SubmissionRecord>,
+    pub documents: Vec<DocumentWrite>,
+}
+
+/// Accepted batches from one `commit`, plus the first refusal if a later batch failed its checks.
+#[derive(Debug)]
+pub(crate) struct ApplyOutcome {
+    pub seqs: Vec<i64>,
+    pub writes: Vec<BatchWrite>,
+    pub refused: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Action {
     create: Option<DocumentCreate>,
@@ -153,50 +182,35 @@ impl Engine {
         self.next_seq
     }
 
-    pub(crate) fn record_types(&self) -> &HashMap<i64, RecordType> {
-        &self.record_types
-    }
-
-    pub(crate) fn conversations(&self) -> &HashMap<i64, ConversationRecord> {
-        &self.conversations
-    }
-
-    pub(crate) fn entries(&self) -> &HashMap<i64, EntryRecord> {
-        &self.entries
-    }
-
-    pub(crate) fn entry_commit_seqs(&self) -> &HashMap<i64, i64> {
-        &self.entry_commit_seqs
-    }
-
-    pub(crate) fn tasks(&self) -> &HashMap<i64, TaskRecord> {
-        &self.tasks
-    }
-
-    pub(crate) fn submissions(&self) -> &HashMap<i64, SubmissionRecord> {
-        &self.submissions
-    }
-
-    pub(crate) fn documents(&self) -> &HashMap<i64, StoredDoc> {
-        &self.documents
-    }
-
     /// Apply every batch that passes checks. A refusal keeps earlier batches and drops the rest.
+    ///
+    /// `writes` lists only the rows those batches changed.
     pub(crate) fn apply_batches(
         &mut self,
         batches: &[Vec<StorageWrite>],
-    ) -> Result<(Vec<i64>, Option<String>), Error> {
+    ) -> Result<ApplyOutcome, Error> {
         let mut seqs = Vec::new();
+        let mut writes = Vec::new();
         for batch in batches {
             let prepared = match self.prepare(batch) {
                 Ok(prepared) => prepared,
-                Err(message) => return Ok((seqs, Some(format!("Error: {message}")))),
+                Err(message) => {
+                    return Ok(ApplyOutcome {
+                        seqs,
+                        writes,
+                        refused: Some(format!("Error: {message}")),
+                    })
+                }
             };
             let seq = self.next_seq;
-            self.apply_prepared(prepared, seq);
+            writes.push(self.apply_prepared(prepared, seq));
             seqs.push(seq);
         }
-        Ok((seqs, None))
+        Ok(ApplyOutcome {
+            seqs,
+            writes,
+            refused: None,
+        })
     }
 
     pub(crate) fn mint_id(&mut self) -> Result<i64, Error> {
@@ -725,14 +739,38 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_prepared(&mut self, prepared: (Vec<StorageWrite>, Vec<(i64, Action)>), seq: i64) {
+    fn apply_prepared(
+        &mut self,
+        prepared: (Vec<StorageWrite>, Vec<(i64, Action)>),
+        seq: i64,
+    ) -> BatchWrite {
         let (writes, actions) = prepared;
+        let mut applied = BatchWrite {
+            seq,
+            conversations: Vec::new(),
+            entries: Vec::new(),
+            tasks: Vec::new(),
+            submissions: Vec::new(),
+            documents: Vec::new(),
+        };
         for write in writes {
             match write {
-                StorageWrite::Conversation { value } => self.put_conversation(value),
-                StorageWrite::Entry { value } => self.put_entry(value, seq),
-                StorageWrite::Task { value } => self.put_task(value),
-                StorageWrite::Submission { value } => self.put_submission(value),
+                StorageWrite::Conversation { value } => {
+                    applied.conversations.push(value.clone());
+                    self.put_conversation(value);
+                }
+                StorageWrite::Entry { value } => {
+                    applied.entries.push(value.clone());
+                    self.put_entry(value, seq);
+                }
+                StorageWrite::Task { value } => {
+                    applied.tasks.push(value.clone());
+                    self.put_task(value);
+                }
+                StorageWrite::Submission { value } => {
+                    applied.submissions.push(value.clone());
+                    self.put_submission(value);
+                }
                 StorageWrite::DocumentCopy { .. } => {
                     unreachable!("document copy is resolved before apply")
                 }
@@ -741,11 +779,13 @@ impl Engine {
                 | StorageWrite::DocumentRetire { .. } => {}
             }
         }
-        self.apply_actions(actions, seq);
+        applied.documents = self.apply_actions(actions, seq);
         self.next_seq = seq + 1;
+        applied
     }
 
-    fn apply_actions(&mut self, actions: Vec<(i64, Action)>, seq: i64) {
+    fn apply_actions(&mut self, actions: Vec<(i64, Action)>, seq: i64) -> Vec<DocumentWrite> {
+        let mut writes = Vec::new();
         for (id, action) in actions {
             if let Some(create) = action.create {
                 let record = record_from_create(&create, seq, action.retire);
@@ -769,10 +809,22 @@ impl Engine {
                 insert_sorted(self.document_ids_by_scope.entry(scope).or_default(), id);
                 self.record_types.insert(id, RecordType::Document);
                 self.bump(id);
+                writes.push(DocumentWrite {
+                    inserted: true,
+                    record: record.clone(),
+                    replace_revisions: false,
+                    revisions: revisions.clone(),
+                });
                 self.documents.insert(id, StoredDoc { record, revisions });
             } else {
                 let key = {
                     let stored = self.documents.get_mut(&id).expect("checked document");
+                    let before_len = stored.revisions.len();
+                    let before_seqs: Vec<i64> = stored
+                        .revisions
+                        .iter()
+                        .map(|revision| revision.seq)
+                        .collect();
                     if let Some(content) = action.content {
                         let revision = Revision { seq, content };
                         if matches!(revision.content, DocumentContent::Base { .. })
@@ -789,6 +841,23 @@ impl Engine {
                             stored.revisions.clear();
                         }
                     }
+                    let replace_revisions = stored.revisions.len() < before_len
+                        || stored
+                            .revisions
+                            .iter()
+                            .zip(&before_seqs)
+                            .any(|(revision, previous)| revision.seq != *previous);
+                    let revisions = if replace_revisions {
+                        stored.revisions.clone()
+                    } else {
+                        stored.revisions[before_len..].to_vec()
+                    };
+                    writes.push(DocumentWrite {
+                        inserted: false,
+                        record: stored.record.clone(),
+                        replace_revisions,
+                        revisions,
+                    });
                     addr_key_record(&stored.record)
                 };
                 if action.retire {
@@ -800,6 +869,7 @@ impl Engine {
                 }
             }
         }
+        writes
     }
 
     fn put_conversation(&mut self, record: ConversationRecord) {

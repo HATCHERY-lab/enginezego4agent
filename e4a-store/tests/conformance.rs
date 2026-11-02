@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use e4a_store::{
@@ -363,6 +364,164 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Closes and reopens the same file after every commit, so reads hit a cache loaded from disk.
+struct Reopening {
+    path: PathBuf,
+    inner: RefCell<Option<Rc<SqliteStorage>>>,
+    closed: Cell<bool>,
+}
+
+impl Reopening {
+    fn open(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            inner: RefCell::new(Some(Rc::new(SqliteStorage::open(path).unwrap()))),
+            closed: Cell::new(false),
+        }
+    }
+
+    fn current(&self) -> Result<Rc<SqliteStorage>, Error> {
+        if self.closed.get() {
+            return Err(Error::message("SqliteStorage is closed"));
+        }
+        self.inner
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::message("SqliteStorage is closed"))
+    }
+
+    fn with_live<T>(
+        &self,
+        body: impl FnOnce(&SqliteStorage) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let storage = self.current()?;
+        body(&storage)
+    }
+}
+
+impl Storage for Reopening {
+    fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut dyn FnMut(usize, i64),
+    ) -> Result<CommitResult, Error> {
+        let storage = self.current()?;
+        let result = storage.commit(batches, receive)?;
+        storage.close()?;
+        *self.inner.borrow_mut() = Some(Rc::new(SqliteStorage::open(&self.path)?));
+        Ok(result)
+    }
+
+    fn mint_id(&self) -> Result<i64, Error> {
+        self.with_live(|storage| storage.mint_id())
+    }
+
+    fn conversation(&self, id: i64) -> Result<Option<ConversationRecord>, Error> {
+        self.with_live(|storage| storage.conversation(id))
+    }
+
+    fn scan_conversations(
+        &self,
+        query: &ConversationQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<ConversationRecord>, Error> {
+        self.with_live(|storage| storage.scan_conversations(query, limit, cursor))
+    }
+
+    fn entry(&self, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.with_live(|storage| storage.entry(id))
+    }
+
+    fn entry_in(&self, conversation_id: i64, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.with_live(|storage| storage.entry_in(conversation_id, id))
+    }
+
+    fn find_latest_head_marker(
+        &self,
+        conversation_id: i64,
+        at_or_before: Option<i64>,
+    ) -> Result<Option<EntryRecord>, Error> {
+        self.with_live(|storage| storage.find_latest_head_marker(conversation_id, at_or_before))
+    }
+
+    fn scan_entries(
+        &self,
+        query: &EntryQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<EntryRecord>, Error> {
+        self.with_live(|storage| storage.scan_entries(query, limit, cursor))
+    }
+
+    fn task(&self, id: i64) -> Result<Option<TaskRecord>, Error> {
+        self.with_live(|storage| storage.task(id))
+    }
+
+    fn scan_tasks(
+        &self,
+        query: &TaskQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<TaskRecord>, Error> {
+        self.with_live(|storage| storage.scan_tasks(query, limit, cursor))
+    }
+
+    fn submission(&self, id: i64) -> Result<Option<SubmissionRecord>, Error> {
+        self.with_live(|storage| storage.submission(id))
+    }
+
+    fn scan_submissions(
+        &self,
+        query: &SubmissionQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<SubmissionRecord>, Error> {
+        self.with_live(|storage| storage.scan_submissions(query, limit, cursor))
+    }
+
+    fn submission_by_request(
+        &self,
+        conversation_id: i64,
+        request_id: &str,
+    ) -> Result<Option<SubmissionRecord>, Error> {
+        self.with_live(|storage| storage.submission_by_request(conversation_id, request_id))
+    }
+
+    fn find_document(
+        &self,
+        address: &DocumentAddress,
+        at: DocumentPoint,
+    ) -> Result<Option<e4a_store::DocumentRecord>, Error> {
+        self.with_live(|storage| storage.find_document(address, at))
+    }
+
+    fn document(&self, id: i64, at: DocumentPoint) -> Result<Option<StoredDocument>, Error> {
+        self.with_live(|storage| storage.document(id, at))
+    }
+
+    fn scan_documents(
+        &self,
+        query: &DocumentQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<e4a_store::DocumentRecord>, Error> {
+        self.with_live(|storage| storage.scan_documents(query, limit, cursor))
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        if self.closed.get() {
+            return Ok(());
+        }
+        self.closed.set(true);
+        if let Some(storage) = self.inner.borrow().as_ref().cloned() {
+            storage.close()?;
+        }
+        Ok(())
+    }
+}
+
 fn run_both(case: &'static str, body: fn(&dyn Storage)) {
     let memory = MemoryStorage::new();
     let bomb = Bomb {
@@ -379,6 +538,15 @@ fn run_both(case: &'static str, body: fn(&dyn Storage)) {
     };
     body(&Checking::new(&sqlite));
     drop(bomb);
+    let temp_reopen = TempDb::new();
+    let reopening = Reopening::open(&temp_reopen.path);
+    let bomb = Bomb {
+        case,
+        backend: "sqlite-reopen",
+    };
+    body(&Checking::new(&reopening));
+    drop(bomb);
+    reopening.close().unwrap();
 }
 
 fn reserves_id_1(storage: &dyn Storage) {

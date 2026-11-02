@@ -1,6 +1,9 @@
 // Portions derived from @earendil-works/chord 1.5.0 (packages/chord/src/delta), MIT, © 2025 Mario Zechner / Earendil Works. See LICENSES/pi-MIT.txt.
 
 //! Chord `apply` for decoded document ops. Paths stay inside the value: reserved segments are rejected.
+//!
+//! Chord `Op` (`set`, `splice`, and the rest) is not RFC 6902, so this module
+//! does not use the `json-patch` crate.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};

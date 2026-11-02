@@ -48,7 +48,9 @@ impl Storage for MemoryStorage {
         receive: &mut dyn FnMut(usize, i64),
     ) -> Result<CommitResult, Error> {
         self.ensure()?;
-        let (seqs, refused) = self.engine.borrow_mut().apply_batches(batches)?;
+        let applied = self.engine.borrow_mut().apply_batches(batches)?;
+        let seqs = applied.seqs;
+        let refused = applied.refused;
         for (index, seq) in seqs.iter().enumerate() {
             receive(index, *seq);
         }

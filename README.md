@@ -27,6 +27,18 @@ are pushed here after each stage, never force-pushed.
 
 Plan: `hatchery-websession-docs/docs/plans/engine4agent.md`.
 
+## Store
+
+Document deltas are Chord operations (`set`, `splice`, and the other `Op` variants
+in `e4a-types`). Those operations are not RFC 6902, so `e4a-types/src/apply.rs`
+applies them directly. The `json-patch` crate is the wrong tool for that and is
+not a dependency.
+
+`SqliteStorage` is `!Sync` (`RefCell`). The session layer (Э2) will keep one
+writer thread and send commits to it on a channel — the plan's single writer —
+rather than a `Mutex` held across a task. One handle owns the SQLite file; a
+second `open` of the same path fails.
+
 ## License
 
 MIT, see [`LICENSE`](LICENSE). Third-party notices in [`NOTICE`](NOTICE).
