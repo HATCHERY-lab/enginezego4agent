@@ -4,3 +4,5 @@ work/
 *.sqlite
 *.sqlite-*
 *.err
+/target
+
