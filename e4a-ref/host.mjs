@@ -7,7 +7,7 @@ import { createRegistry, defineExtension, Harness, UsageDoc } from "@earendil-wo
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createPowerShellTool, createReadTool } from "@earendil-works/pi-durable/tools";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,7 +45,16 @@ const log = (kind, value) => appendFileSync(logPath, scrub({ t: Date.now(), kind
 if (process.env.E4A_SSE) {
 	const orig = globalThis.fetch;
 	const ssePath = process.env.E4A_SSE;
-	let raw = "";
+	const hold = 512;
+	let pending = "";
+	const push = (chunk, final) => {
+		pending += chunk;
+		const keep = final ? 0 : hold;
+		if (pending.length <= keep) return;
+		const emit = pending.slice(0, pending.length - keep);
+		pending = pending.slice(pending.length - keep);
+		appendFileSync(ssePath, scrub(emit));
+	};
 	globalThis.fetch = async (input, init) => {
 		const res = await orig(input, init);
 		const type = res.headers.get("content-type") || "";
@@ -53,8 +62,10 @@ if (process.env.E4A_SSE) {
 		const [a, b] = res.body.tee();
 		b.pipeTo(new WritableStream({
 			write(chunk) {
-				raw += Buffer.from(chunk).toString("utf8");
-				writeFileSync(ssePath, scrub(raw));
+				push(Buffer.from(chunk).toString("utf8"), false);
+			},
+			close() {
+				push("", true);
 			},
 		})).catch(() => {});
 		return new Response(a, { status: res.status, statusText: res.statusText, headers: res.headers });

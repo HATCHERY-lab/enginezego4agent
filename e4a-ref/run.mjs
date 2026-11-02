@@ -170,9 +170,18 @@ function saveFixture(name, logPath, ssePath) {
 	return true;
 }
 
+function allowModel(model) {
+	if (!model || FREE.includes(model) || process.env.E4A_ALLOW_PAID === "1") return;
+	console.log("FAILED paid-not-allowed");
+	process.exit(1);
+}
+
 async function probe(model) {
 	const dir = join(work, "probe", slug(model));
 	mkdirSync(dir, { recursive: true });
+	for (const name of ["session.sqlite", "session.sqlite-wal", "session.sqlite-shm"]) {
+		rmSync(join(dir, name), { force: true });
+	}
 	const log = join(dir, "run.jsonl");
 	writeFileSync(log, "");
 	const result = await once("probe", {
@@ -200,6 +209,7 @@ async function pickModels(needSecond) {
 		return ok;
 	};
 	let model = process.env.E4A_MODEL || "";
+	allowModel(model);
 	if (!model) {
 		for (const candidate of FREE) {
 			if (await works(candidate)) {
@@ -212,6 +222,7 @@ async function pickModels(needSecond) {
 	if (!model) return null;
 	if (!needSecond) return { model, model2: "" };
 	let model2 = process.env.E4A_MODEL2 || "";
+	allowModel(model2);
 	if (!model2 || model2 === model) {
 		model2 = "";
 		for (const candidate of FREE) {
