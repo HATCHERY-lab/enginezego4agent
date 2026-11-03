@@ -3,7 +3,7 @@ name = "e4a-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Memory and SQLite durable storage for engine4agent"
+description = "Memory and SQLite durable storage for agent4agent"
 publish = false
 
 [dependencies]

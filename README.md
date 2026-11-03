@@ -1,4 +1,4 @@
-# engine4agent (e4a)
+# agent4agent (e4a)
 
 Durable agent engine for Hatchery: give it an API key or an inference endpoint,
 get an agent with tools, sessions, forks, checkpointed tasks and cost accounting
@@ -21,7 +21,7 @@ ideas from upstream selectively.
 
 ## Where the code lives
 
-Working code lives in the Hatchery **federated git trees** (tree `engine4agent`).
+Working code lives in the Hatchery **federated git trees** (tree `agent4agent`).
 This private repository is an **independent origin for checkpoints**: snapshots
 are pushed here after each stage, never force-pushed.
 
