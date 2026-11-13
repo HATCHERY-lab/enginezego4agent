@@ -23,12 +23,28 @@ fn main() -> ExitCode {
 
 fn serve() -> Result<(), String> {
     let stdin = io::stdin();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line.contains("\"session/cancel\"") {
+                e4a_tools::request_cancel();
+                continue;
+            }
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|err| err.to_string())?;
-        match e4a_host::handle_line(&line) {
-            Ok(reply) => {
-                stdout.write_all(reply.as_bytes()).map_err(|err| err.to_string())?;
+    while let Ok(line) = rx.recv() {
+        match e4a_host::handle_exchange(&line) {
+            Ok(replies) => {
+                for reply in replies {
+                    stdout
+                        .write_all(reply.as_bytes())
+                        .map_err(|err| err.to_string())?;
+                }
                 stdout.flush().map_err(|err| err.to_string())?;
             }
             Err(err) => eprintln!("{err}"),

@@ -9,12 +9,14 @@
 //! `e4a_harness::resolve` are non-empty. That case dials OpenRouter. A dial or
 //! turn failure is JSON-RPC `-32603`, and the key is not copied into the message.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use e4a_harness::{resolve, shutdown, ProviderSessions, TurnInput, TurnKind};
 use e4a_llm::{FauxLlm, Llm, OpenRouterClient, ToolSchema, Usage};
 use e4a_session::{EntryRecord, Session, SessionEnd, StoreKind, ROOT_CONVERSATION_ID};
-use e4a_tools::{run_until_answer, Workspace};
+use e4a_tools::{request_cancel_session, run_until_answer_in, Workspace};
 use serde_json::{json, Value};
 
 /// Subcommand of `e4a`. [`Command::Acp`] is the only subcommand besides help.
@@ -73,7 +75,11 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// `e4a_harness::resolve("openrouter")` are non-empty, in which case the turn
 /// dials OpenRouter. Missing prompt text, or a missing workspace root, is
 /// JSON-RPC `-32602`. A failure is JSON-RPC `-32603` and does not include the key.
-pub fn handle_line(line: &str) -> Result<String, String> {
+/// One request may emit `session/update` notifications and then the response.
+///
+/// `session/cancel` is a notification: the vec is empty. Other methods put the
+/// JSON-RPC response last.
+pub fn handle_exchange(line: &str) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
         .as_object()
@@ -84,24 +90,63 @@ pub fn handle_line(line: &str) -> Result<String, String> {
         .ok_or_else(|| "JSON-RPC message requires a string method".to_string())?;
     let id = obj.get("id").cloned().unwrap_or(Value::Null);
     let params = obj.get("params");
-    let reply = match method {
-        "initialize" => result(
-            id,
-            json!({
-                "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": false}
-            }),
-        ),
-        "session/new" => session_new(id, params),
+    let values = match method {
+        "initialize" => vec![initialize(id)],
+        "session/new" => vec![session_new(id, params)],
+        "session/load" => session_load(id, params),
         "session/prompt" => session_prompt(id, params),
-        _ => rpc_error(id, -32601, "Method not found"),
+        "session/cancel" => {
+            let session_id = params
+                .and_then(|params| params.get("sessionId"))
+                .and_then(Value::as_str)
+                .unwrap_or("*");
+            request_cancel_session(session_id);
+            Vec::new()
+        }
+        "session/close" => vec![session_close(id, params)],
+        "session/list" => vec![session_list(id)],
+        "session/set_model" => vec![session_set_model(id, params)],
+        "session/set_config_option" => vec![session_set_config(id, params)],
+        _ => vec![rpc_error(id, -32601, "Method not found")],
     };
-    to_line(&reply)
+    values.into_iter().map(|value| to_line(&value)).collect()
+}
+
+/// The last line of [`handle_exchange`]. A cancel notification is an empty string.
+pub fn handle_line(line: &str) -> Result<String, String> {
+    let mut lines = handle_exchange(line)?;
+    Ok(lines.pop().unwrap_or_default())
+}
+
+fn initialize(id: Value) -> Value {
+    result(
+        id,
+        json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {
+                    "image": false,
+                    "audio": false,
+                    "embeddedContext": false
+                }
+            },
+            "agentInfo": {
+                "name": "e4a",
+                "title": "engine4agent",
+                "version": "1.5.3"
+            },
+            "authMethods": []
+        }),
+    )
 }
 
 fn session_new(id: Value, params: Option<&Value>) -> Value {
     match cwd_param(params) {
-        Some(cwd) => result(id, json!({"sessionId": cwd})),
+        Some(cwd) => {
+            remember_session(cwd, cwd);
+            result(id, json!({"sessionId": cwd}))
+        }
         None => rpc_error(id, -32602, "cwd must be a non-empty string"),
     }
 }
@@ -124,13 +169,18 @@ fn workspace_root(params: Option<&Value>) -> Option<&str> {
     }
 }
 
-fn session_prompt(id: Value, params: Option<&Value>) -> Value {
+fn session_prompt(id: Value, params: Option<&Value>) -> Vec<Value> {
     let Some(user_text) = prompt_text(params) else {
-        return rpc_error(id, -32602, "prompt must be one non-empty text block");
+        return vec![rpc_error(id, -32602, "prompt must be one non-empty text block")];
     };
     let Some(root) = workspace_root(params) else {
-        return rpc_error(id, -32602, "cwd or sessionId must be a non-empty string");
+        return vec![rpc_error(
+            id,
+            -32602,
+            "cwd or sessionId must be a non-empty string",
+        )];
     };
+    remember_session(root, root);
     let socks = std::env::var("E4A_SOCKS").ok();
     // Err means no key. The error is not copied into the reply.
     let key = resolve("openrouter").ok();
@@ -143,7 +193,7 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(err) => return rpc_error(id, -32603, &err.to_string()),
+        Err(err) => return vec![rpc_error(id, -32603, &err.to_string())],
     };
     let answered = if openrouter {
         runtime.block_on(openrouter_prompt(
@@ -157,17 +207,25 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
         runtime.block_on(faux_prompt(user_text, root, openrouter))
     };
     match answered {
-        Ok((text, tail)) => result(
+        Ok((text, tail, updates)) => {
+            let mut lines = updates;
+            lines.push(result(
+                id,
+                json!({"stopReason": "end_turn", "text": text, "tail": tail}),
+            ));
+            lines
+        }
+        Err(err) if err == "cancelled" => vec![result(
             id,
-            json!({"stopReason": "end_turn", "text": text, "tail": tail}),
-        ),
+            json!({"stopReason": "cancelled", "text": "", "tail": []}),
+        )],
         Err(err) => {
             let message = if openrouter {
                 redact_key(&err, key.as_deref().unwrap_or(""))
             } else {
                 err
             };
-            rpc_error(id, -32603, &message)
+            vec![rpc_error(id, -32603, &message)]
         }
     }
 }
@@ -199,7 +257,7 @@ async fn faux_prompt(
     user_text: &str,
     root: &str,
     openrouter: bool,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>, Vec<Value>), String> {
     let llm = FauxLlm::text(user_text).with_usage(Usage {
         input_tokens: 1,
         output_tokens: 1,
@@ -215,9 +273,9 @@ async fn openrouter_prompt(
     socks: &str,
     key: &str,
     openrouter: bool,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>, Vec<Value>), String> {
     let from_env = std::env::var("E4A_MODEL").ok();
-    let model = openrouter_model(from_env.as_deref());
+    let model = session_model(root).unwrap_or_else(|| openrouter_model(from_env.as_deref()));
     let llm = OpenRouterClient::new(model)
         .with_socks(socks)
         .with_key(key);
@@ -237,7 +295,7 @@ async fn memory_prompt(
     root: &str,
     llm: &impl Llm,
     openrouter: bool,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>, Vec<Value>), String> {
     let session = open_journal(root).await?;
     let provider = if openrouter { "openrouter" } else { "faux" };
     let mut sessions = ProviderSessions::default();
@@ -253,12 +311,13 @@ async fn memory_prompt(
     } else {
         Some("provider session was not released".to_string())
     };
+    let updates = journal_updates(&session, root).await;
     let closed = close_journal(&session).await;
     if let Some(err) = shutdown_err {
         return Err(err);
     }
     match (answered, closed) {
-        (Ok(text), Ok(())) => Ok(text),
+        (Ok((text, tail)), Ok(())) => Ok((text, tail, updates)),
         (Ok(_), Err(err)) | (Err(err), _) => Err(err),
     }
 }
@@ -279,11 +338,15 @@ async fn close_journal(session: &Session) -> Result<(), String> {
 /// does not use `root`. Any other `E4A_STORE` is `unknown session store` and
 /// does not open a session.
 async fn open_journal(root: &str) -> Result<Session, String> {
-    let configured = match std::env::var("E4A_STORE") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => String::new(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("unknown session store".to_string());
+    let configured = if let Some(store) = session_store(root) {
+        store
+    } else {
+        match std::env::var("E4A_STORE") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("unknown session store".to_string());
+            }
         }
     };
     let root = Path::new(root);
@@ -317,7 +380,7 @@ async fn turn_text(
         user_text: user_text.to_string(),
         tools: offered_tools(),
     };
-    let outcome = run_until_answer(session, llm, &workspace, &input)
+    let outcome = run_until_answer_in(session, llm, &workspace, &input, root)
         .await
         .map_err(|err| err.to_string())?;
     let TurnKind::Answered { entry_id } = outcome.kind else {
@@ -475,6 +538,210 @@ fn entry_text(entry: &EntryRecord) -> Result<String, String> {
         .ok_or_else(|| "assistant entry has no text".to_string())
 }
 
+struct SavedSession {
+    cwd: String,
+    model: Option<String>,
+    store: Option<String>,
+}
+
+fn sessions() -> std::sync::MutexGuard<'static, BTreeMap<String, SavedSession>> {
+    static SESSIONS: Mutex<BTreeMap<String, SavedSession>> = Mutex::new(BTreeMap::new());
+    SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn remember_session(id: &str, cwd: &str) {
+    sessions().entry(id.to_string()).or_insert(SavedSession {
+        cwd: cwd.to_string(),
+        model: None,
+        store: None,
+    });
+}
+
+fn session_model(id: &str) -> Option<String> {
+    sessions().get(id).and_then(|saved| saved.model.clone())
+}
+
+fn session_store(id: &str) -> Option<String> {
+    sessions().get(id).and_then(|saved| saved.store.clone())
+}
+
+fn session_load(id: Value, params: Option<&Value>) -> Vec<Value> {
+    let Some(session_id) = params
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return vec![rpc_error(id, -32602, "sessionId must be a non-empty string")];
+    };
+    let cwd = cwd_param(params).unwrap_or(session_id);
+    remember_session(session_id, cwd);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => return vec![rpc_error(id, -32603, &err.to_string())],
+    };
+    match runtime.block_on(replay(cwd, session_id)) {
+        Ok(mut updates) => {
+            updates.push(result(id, json!({"sessionId": session_id})));
+            updates
+        }
+        Err(err) => vec![rpc_error(id, -32603, &err)],
+    }
+}
+
+async fn replay(cwd: &str, session_id: &str) -> Result<Vec<Value>, String> {
+    let session = open_journal(cwd).await?;
+    let socks = std::env::var("E4A_SOCKS").ok();
+    let key = resolve("openrouter").ok();
+    let openrouter = prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter";
+    let finished = if openrouter {
+        let model = session_model(session_id).unwrap_or_else(|| {
+            openrouter_model(std::env::var("E4A_MODEL").ok().as_deref())
+        });
+        let llm = OpenRouterClient::new(model)
+            .with_socks(socks.unwrap_or_default())
+            .with_key(key.unwrap_or_default());
+        e4a_tools::resume_turns(&session, &Workspace::new(cwd).map_err(|err| err.to_string())?, &llm)
+            .await
+            .map(|_| ())
+    } else {
+        let llm = FauxLlm::text("resumed");
+        e4a_tools::resume_turns(&session, &Workspace::new(cwd).map_err(|err| err.to_string())?, &llm)
+            .await
+            .map(|_| ())
+    };
+    let updates = journal_updates(&session, session_id).await;
+    let closed = close_journal(&session).await;
+    finished.map_err(|err| err.to_string())?;
+    closed?;
+    Ok(updates)
+}
+
+fn session_close(id: Value, params: Option<&Value>) -> Value {
+    let Some(session_id) = params
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return rpc_error(id, -32602, "sessionId must be a non-empty string");
+    };
+    request_cancel_session(session_id);
+    sessions().remove(session_id);
+    result(id, Value::Null)
+}
+
+fn session_list(id: Value) -> Value {
+    let listed: Vec<Value> = sessions()
+        .iter()
+        .map(|(session_id, saved)| json!({"sessionId": session_id, "cwd": saved.cwd}))
+        .collect();
+    result(id, json!({"sessions": listed}))
+}
+
+fn session_set_model(id: Value, params: Option<&Value>) -> Value {
+    let Some(session_id) = params
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return rpc_error(id, -32602, "sessionId must be a non-empty string");
+    };
+    let Some(model) = params
+        .and_then(|params| params.get("modelId"))
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    else {
+        return rpc_error(id, -32602, "modelId must be a non-empty string");
+    };
+    remember_session(session_id, session_id);
+    if let Some(saved) = sessions().get_mut(session_id) {
+        saved.model = Some(model.to_string());
+    }
+    result(id, Value::Null)
+}
+
+fn session_set_config(id: Value, params: Option<&Value>) -> Value {
+    let Some(session_id) = params
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return rpc_error(id, -32602, "sessionId must be a non-empty string");
+    };
+    let Some(config_id) = params
+        .and_then(|params| params.get("configId"))
+        .and_then(Value::as_str)
+    else {
+        return rpc_error(id, -32602, "configId must be a string");
+    };
+    let Some(value) = params
+        .and_then(|params| params.get("value"))
+        .and_then(Value::as_str)
+    else {
+        return rpc_error(id, -32602, "value must be a string");
+    };
+    remember_session(session_id, session_id);
+    let mut saved_sessions = sessions();
+    let Some(saved) = saved_sessions.get_mut(session_id) else {
+        return rpc_error(id, -32603, "session was not stored");
+    };
+    match config_id {
+        "model" => saved.model = Some(value.to_string()),
+        "store" if matches!(value, "" | "sqlite" | "jsonl" | "idb") => {
+            saved.store = Some(value.to_string());
+        }
+        "store" => return rpc_error(id, -32602, "store must be sqlite, jsonl, or idb"),
+        _ => return rpc_error(id, -32602, "unknown configId"),
+    }
+    result(id, Value::Null)
+}
+
+async fn journal_updates(session: &Session, session_id: &str) -> Vec<Value> {
+    let Ok(view) = session.watch(ROOT_CONVERSATION_ID).await else {
+        return Vec::new();
+    };
+    let entries: Vec<(String, String)> = view
+        .borrow()
+        .entries
+        .iter()
+        .map(|entry| (entry.kind.clone(), chunk_text(entry)))
+        .collect();
+    drop(view);
+    entries
+        .into_iter()
+        .map(|(kind, text)| {
+            let session_update = match kind.as_str() {
+                "pi.user" => "user_message_chunk",
+                "pi.toolResult" => "tool_call_update",
+                _ => "agent_message_chunk",
+            };
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": session_update,
+                        "content": {"type": "text", "text": text}
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+fn chunk_text(entry: &EntryRecord) -> String {
+    entry_text(entry).unwrap_or_else(|_| {
+        entry
+            .model
+            .as_ref()
+            .map(|model| model.to_string())
+            .unwrap_or_default()
+    })
+}
+
 fn result(id: Value, value: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": value})
 }
@@ -518,7 +785,9 @@ mod tests {
         assert_eq!(value["jsonrpc"], json!("2.0"));
         assert_eq!(value["id"], json!(1));
         assert_eq!(value["result"]["protocolVersion"], json!(1));
-        assert_eq!(value["result"]["agentCapabilities"]["loadSession"], json!(false));
+        assert_eq!(value["result"]["agentCapabilities"]["loadSession"], json!(true));
+        assert_eq!(value["result"]["agentInfo"]["name"], json!("e4a"));
+        assert_eq!(value["result"]["authMethods"], json!([]));
     }
 
     #[test]
@@ -620,8 +889,55 @@ mod tests {
     }
 
     #[test]
+    fn session_controls_list_model_cancel_and_load() {
+        let root = std::env::temp_dir().join(format!(
+            "e4a-acp-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let root = root.to_string_lossy().replace('\\', "/");
+        let listed = handle_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{root}"}}}}"#
+        ))
+        .unwrap();
+        assert!(listed.contains(&root));
+        let list = handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"session/list"}"#).unwrap();
+        assert!(list.contains(&root));
+        let model = handle_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{{"sessionId":"{root}","modelId":"cohere/north-mini-code:free"}}}}"#
+        ))
+        .unwrap();
+        assert!(model.contains("\"result\":null") || model.contains("\"result\": null"));
+        let config = handle_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{{"sessionId":"{root}","configId":"store","value":"sqlite"}}}}"#
+        ))
+        .unwrap();
+        assert!(!config.contains("\"error\""));
+        handle_exchange(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":"{root}"}}}}"#
+        ))
+        .unwrap();
+        let cancelled = handle_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{{"sessionId":"{root}","prompt":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .unwrap();
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        let loaded = handle_exchange(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"session/load","params":{{"sessionId":"{root}","cwd":"{root}"}}}}"#
+        ))
+        .unwrap();
+        assert!(loaded.iter().any(|line| line.contains("user_message_chunk") || line.contains("agent_message_chunk") || line.contains("sessionId")));
+        let closed = handle_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"session/close","params":{{"sessionId":"{root}"}}}}"#
+        ))
+        .unwrap();
+        assert!(closed.contains("\"result\":null") || closed.contains("\"result\": null"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unknown_method_is_not_found() {
-        let line = handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"session/load"}"#)
+        let line = handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"session/nope"}"#)
             .expect("error reply");
         let value = parse_reply(&line);
         assert_eq!(value["id"], json!(4));

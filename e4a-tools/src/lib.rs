@@ -28,6 +28,35 @@ use e4a_session::{EntryDraft, EntryRecord, Session, Tx};
 use e4a_types::{Json, TaskOutcome, TaskOutcomeError, TaskState};
 use serde_json::json;
 
+static CANCEL_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The ACP client asked to stop one session. `"*"` stops whichever turn takes it.
+pub fn request_cancel_session(session_id: &str) {
+    if let Ok(mut guard) = CANCEL_SESSION.lock() {
+        *guard = Some(session_id.to_string());
+    }
+}
+
+/// The ACP client asked to stop the foreground turn.
+pub fn request_cancel() {
+    request_cancel_session("*");
+}
+
+fn take_cancel_for(session_id: &str) -> bool {
+    let Ok(mut guard) = CANCEL_SESSION.lock() else {
+        return false;
+    };
+    let hit = match guard.as_deref() {
+        Some("*") => true,
+        Some(id) => id == session_id,
+        None => false,
+    };
+    if hit {
+        *guard = None;
+    }
+    hit
+}
+
 const TOOL_KIND: &str = "pi.tool";
 const TOOL_RESULT_KIND: &str = "pi.toolResult";
 const ASSISTANT_KIND: &str = "pi.assistant";
@@ -86,9 +115,26 @@ pub async fn run_until_answer<L: Llm>(
     workspace: &Workspace,
     input: &TurnInput,
 ) -> Result<TurnOutcome, Error> {
+    run_until_answer_in(session, llm, workspace, input, "").await
+}
+
+/// Same as [`run_until_answer`], but a matching [`request_cancel_session`] stops the loop.
+pub async fn run_until_answer_in<L: Llm>(
+    session: &Session,
+    llm: &L,
+    workspace: &Workspace,
+    input: &TurnInput,
+    session_id: &str,
+) -> Result<TurnOutcome, Error> {
+    if take_cancel_for(session_id) {
+        return Err(Error::message("cancelled"));
+    }
     let mut outcome = Generation::turn(session, llm, input).await?;
     let mut iterations = 0_i64;
     while matches!(outcome.kind, TurnKind::WaitingTool { .. }) {
+        if take_cancel_for(session_id) {
+            return Err(Error::message("cancelled"));
+        }
         if iterations >= MODEL_CALL_CAP {
             break;
         }
