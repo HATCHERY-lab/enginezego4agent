@@ -12,7 +12,7 @@ mod sqlite;
 
 pub use cloudflare::sqlite_driver;
 pub use e4a_types::*;
-pub use indexeddb::{open, schema, MemoryIdb, ObjectIndex, ObjectStore, Schema};
+pub use indexeddb::{open, schema, IdbStorage, MemoryIdb, ObjectIndex, ObjectStore, Schema};
 pub use jsonl::{
     append_line, is_reclaim_name, is_sidecar_name, parse_line, sidecar_name, JsonlError,
     JsonlStorage, JsonlWriter, FORMAT_VERSION, MAIN_FILE, RECLAIM_SUFFIX,

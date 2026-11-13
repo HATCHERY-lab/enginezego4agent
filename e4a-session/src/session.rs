@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use e4a_store::{JsonlStorage, MemoryStorage, SqliteStorage, Storage};
+use e4a_store::{IdbStorage, JsonlStorage, MemoryStorage, SqliteStorage, Storage};
 use e4a_types::{
     ConversationRecord, DocumentAddress, DocumentQuery, DocumentScope, EntryQuery, EntryRecord,
     Json, ScanOrder, TaskQuery, ROOT_CONVERSATION_ID,
@@ -60,8 +60,10 @@ impl Session {
         Self::open(move || SqliteStorage::open(&path)).await
     }
 
-    /// SQLite and JSONL open a session. IndexedDB runs its opener, then fails:
-    /// that store is not a session backend yet.
+    /// SQLite, JSONL, and IndexedDB each open a session.
+    ///
+    /// JSONL and IndexedDB refuse an empty path before they open a store.
+    /// IndexedDB keeps the path text as the database name. No browser, disk, or network.
     pub async fn open_kind(kind: StoreKind, path: &Path) -> Result<Self, Error> {
         match kind {
             StoreKind::Sqlite => Self::sqlite(path).await,
@@ -73,10 +75,11 @@ impl Session {
                 Self::open(move || JsonlStorage::open(&path)).await
             }
             StoreKind::Idb => {
+                if path.as_os_str().is_empty() {
+                    return Err(Error::message("empty path"));
+                }
                 let name = path.display().to_string();
-                let database = e4a_store::open(&name).map_err(Error::message)?;
-                drop(database);
-                Err(Error::message("idb session is not wired"))
+                Self::open(move || IdbStorage::open(&name)).await
             }
         }
     }

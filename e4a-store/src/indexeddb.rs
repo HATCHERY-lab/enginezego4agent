@@ -4,11 +4,21 @@
 //! In-memory object stores with the pi-durable IndexedDB layout.
 //!
 //! No browser and no disk. [`open`] keeps the database name and the records
-//! in the process. Keys match when their JSON text matches.
+//! in the process. [`IdbStorage`] is the session backend over those stores.
+//! Keys match when their JSON text matches.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+use e4a_types::{
+    CommitResult, ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
+    DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope, EntryHit, EntryQuery, EntryRecord,
+    Page, StoredDocument, SubmissionQuery, SubmissionRecord, TaskQuery, TaskRecord,
+};
 use serde_json::Value;
+
+use crate::engine::{BatchWrite, DocumentWrite, Engine, Revision};
+use crate::{Error, Storage, StorageWrite};
 
 const META_KEY: &str = "state";
 
@@ -135,14 +145,14 @@ fn owned_path(key_path: &[&str]) -> Vec<String> {
     key_path.iter().map(|part| (*part).to_owned()).collect()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StoreBody {
     indexes: Vec<ObjectIndex>,
     rows: BTreeMap<String, Value>,
 }
 
 /// Process-local database. The name is kept and never used as a path.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MemoryIdb {
     name: String,
     stores: BTreeMap<String, StoreBody>,
@@ -246,6 +256,10 @@ impl MemoryIdb {
         Ok(rows)
     }
 
+    fn values(&self, store: &str) -> Result<Vec<Value>, String> {
+        Ok(self.store(store)?.rows.values().cloned().collect())
+    }
+
     fn store(&self, name: &str) -> Result<&StoreBody, String> {
         self.stores
             .get(name)
@@ -279,6 +293,595 @@ fn index_key(value: &Value, path: &[String]) -> Option<Value> {
         1 => parts.into_iter().next(),
         _ => Some(Value::Array(parts)),
     }
+}
+
+/// Process-local IndexedDB session store.
+///
+/// [`IdbStorage::open`] takes the database name. There is no browser, disk, or
+/// network. Reads use the durable engine. Accepted batches land in the object
+/// stores before the commit returns. `RefCell` makes this `!Sync`; one writer
+/// thread owns the handle.
+pub struct IdbStorage {
+    engine: RefCell<Engine>,
+    database: RefCell<MemoryIdb>,
+    closed: Cell<bool>,
+}
+
+impl IdbStorage {
+    /// Open an empty database named `name`.
+    ///
+    /// An empty name is rejected. The seeded `meta` row matches [`open`].
+    pub fn open(name: &str) -> Result<Self, Error> {
+        let database = open(name).map_err(Error::message)?;
+        let engine = load_engine(&database)?;
+        Ok(Self {
+            engine: RefCell::new(engine),
+            database: RefCell::new(database),
+            closed: Cell::new(false),
+        })
+    }
+
+    fn ensure(&self) -> Result<(), Error> {
+        if self.closed.get() {
+            Err(Error::message("IdbStorage is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read<T>(&self, read: impl FnOnce(&Engine) -> Result<T, Error>) -> Result<T, Error> {
+        self.ensure()?;
+        read(&self.engine.borrow())
+    }
+}
+
+impl Storage for IdbStorage {
+    fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut dyn FnMut(usize, i64),
+    ) -> Result<CommitResult, Error> {
+        self.ensure()?;
+        let applied = {
+            let mut engine = self.engine.borrow_mut();
+            engine.apply_batches(batches)?
+        };
+        if !applied.seqs.is_empty() {
+            let next_id = self.engine.borrow().next_id();
+            let next_seq = self.engine.borrow().next_seq();
+            let persist_result = {
+                let mut database = self.database.borrow_mut();
+                persist(&mut database, &applied.writes, next_id, next_seq)
+            };
+            if let Err(error) = persist_result {
+                let loaded = {
+                    let database = self.database.borrow();
+                    load_engine(&database)?
+                };
+                *self.engine.borrow_mut() = loaded;
+                return Err(error);
+            }
+        }
+        for (index, seq) in applied.seqs.iter().enumerate() {
+            receive(index, *seq);
+        }
+        Ok(CommitResult {
+            stored: applied.seqs.len(),
+            refused: applied.refused,
+        })
+    }
+
+    fn mint_id(&self) -> Result<i64, Error> {
+        self.ensure()?;
+        self.engine.borrow_mut().mint_id()
+    }
+
+    fn conversation(&self, id: i64) -> Result<Option<ConversationRecord>, Error> {
+        self.read(|engine| engine.conversation(id))
+    }
+
+    fn scan_conversations(
+        &self,
+        query: &ConversationQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<ConversationRecord>, Error> {
+        self.read(|engine| {
+            engine.scan_conversations(
+                query.owner_conversation_id,
+                query.owner_task_id,
+                query.order,
+                limit,
+                cursor,
+            )
+        })
+    }
+
+    fn entry(&self, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.read(|engine| engine.entry(id))
+    }
+
+    fn entry_in(&self, conversation_id: i64, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.read(|engine| engine.entry_in(conversation_id, id))
+    }
+
+    fn find_latest_head_marker(
+        &self,
+        conversation_id: i64,
+        at_or_before: Option<i64>,
+    ) -> Result<Option<EntryRecord>, Error> {
+        self.read(|engine| engine.find_latest_head_marker(conversation_id, at_or_before))
+    }
+
+    fn scan_entries(
+        &self,
+        query: &EntryQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<EntryRecord>, Error> {
+        self.read(|engine| engine.scan_entries(query, limit, cursor))
+    }
+
+    fn task(&self, id: i64) -> Result<Option<TaskRecord>, Error> {
+        self.read(|engine| engine.task(id))
+    }
+
+    fn scan_tasks(
+        &self,
+        query: &TaskQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<TaskRecord>, Error> {
+        self.read(|engine| engine.scan_tasks(query, limit, cursor))
+    }
+
+    fn submission(&self, id: i64) -> Result<Option<SubmissionRecord>, Error> {
+        self.read(|engine| engine.submission(id))
+    }
+
+    fn scan_submissions(
+        &self,
+        query: &SubmissionQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<SubmissionRecord>, Error> {
+        self.read(|engine| engine.scan_submissions(query, limit, cursor))
+    }
+
+    fn submission_by_request(
+        &self,
+        conversation_id: i64,
+        request_id: &str,
+    ) -> Result<Option<SubmissionRecord>, Error> {
+        self.read(|engine| engine.submission_by_request(conversation_id, request_id))
+    }
+
+    fn find_document(
+        &self,
+        address: &DocumentAddress,
+        at: DocumentPoint,
+    ) -> Result<Option<DocumentRecord>, Error> {
+        self.read(|engine| engine.find_document(address, at))
+    }
+
+    fn document(&self, id: i64, at: DocumentPoint) -> Result<Option<StoredDocument>, Error> {
+        self.read(|engine| engine.document(id, at))
+    }
+
+    fn scan_documents(
+        &self,
+        query: &DocumentQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<DocumentRecord>, Error> {
+        self.read(|engine| engine.scan_documents(query, limit, cursor))
+    }
+
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.ensure()?;
+        self.engine.borrow().ensure_deletable(id)?;
+        {
+            let mut database = self.database.borrow_mut();
+            delete_conversation_rows(&mut database, id)?;
+        }
+        self.engine.borrow_mut().delete_conversation(id)
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        self.closed.set(true);
+        Ok(())
+    }
+}
+
+fn load_engine(database: &MemoryIdb) -> Result<Engine, Error> {
+    let meta = database
+        .get("meta", &Value::String(META_KEY.to_owned()))
+        .map_err(Error::message)?
+        .ok_or_else(|| Error::message("IndexedDB meta state is missing"))?;
+    let next_id = meta
+        .get("nextId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::message("IndexedDB meta nextId is invalid"))?;
+    let next_seq = meta
+        .get("nextSeq")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::message("IndexedDB meta nextSeq is invalid"))?;
+    let mut engine = Engine::new();
+    for row in sorted_rows(database, "conversations")? {
+        engine.load_conversation(serde_json::from_value(record_value(&row)?)?);
+    }
+    for row in sorted_rows(database, "entries")? {
+        let commit_seq = require_i64(&row, "commitSeq")?;
+        engine.load_entry(serde_json::from_value(record_value(&row)?)?, commit_seq);
+    }
+    for row in sorted_rows(database, "tasks")? {
+        engine.load_task(serde_json::from_value(record_value(&row)?)?);
+    }
+    for row in sorted_rows(database, "submissions")? {
+        engine.load_submission(serde_json::from_value(record_value(&row)?)?);
+    }
+    let revisions = database
+        .values("document_revisions")
+        .map_err(Error::message)?;
+    for row in sorted_rows(database, "documents")? {
+        let record: DocumentRecord = serde_json::from_value(record_value(&row)?)?;
+        let mut document_revisions = Vec::new();
+        for revision in &revisions {
+            if revision.get("documentId").and_then(Value::as_i64) == Some(record.id) {
+                document_revisions.push(decode_revision(revision)?);
+            }
+        }
+        document_revisions.sort_by_key(|revision| revision.seq);
+        engine.load_document(record, document_revisions);
+    }
+    engine.finish_load(next_id, next_seq);
+    Ok(engine)
+}
+
+fn sorted_rows(database: &MemoryIdb, store: &str) -> Result<Vec<Value>, Error> {
+    let mut rows = database.values(store).map_err(Error::message)?;
+    rows.sort_by_key(|row| row.get("id").and_then(Value::as_i64).unwrap_or(i64::MIN));
+    Ok(rows)
+}
+
+fn record_value(row: &Value) -> Result<Value, Error> {
+    row.get("record")
+        .cloned()
+        .ok_or_else(|| Error::message("IndexedDB row is missing record"))
+}
+
+fn require_i64(row: &Value, field: &str) -> Result<i64, Error> {
+    row.get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::message(format!("IndexedDB row is missing {field}")))
+}
+
+fn decode_revision(row: &Value) -> Result<Revision, Error> {
+    let seq = require_i64(row, "seq")?;
+    let version = require_i64(row, "version")?;
+    let kind = row
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::message("IndexedDB revision kind is missing"))?;
+    let content_value = row
+        .get("content")
+        .cloned()
+        .ok_or_else(|| Error::message("IndexedDB revision content is missing"))?;
+    let content = match kind {
+        "base" => DocumentContent::Base {
+            version,
+            value: content_value,
+        },
+        "delta" => DocumentContent::Delta {
+            version,
+            ops: serde_json::from_value(content_value)?,
+        },
+        other => {
+            return Err(Error::message(format!(
+                "unknown document revision kind {other}"
+            )))
+        }
+    };
+    Ok(Revision { seq, content })
+}
+
+/// Apply `writes` on a copy. The caller's database changes only after every row is stored.
+fn persist(
+    database: &mut MemoryIdb,
+    writes: &[BatchWrite],
+    next_id: i64,
+    next_seq: i64,
+) -> Result<(), Error> {
+    let mut updated = database.clone();
+    for batch in writes {
+        write_batch(&mut updated, batch)?;
+    }
+    store_meta(&mut updated, next_id, next_seq)?;
+    *database = updated;
+    Ok(())
+}
+
+fn write_batch(database: &mut MemoryIdb, batch: &BatchWrite) -> Result<(), Error> {
+    for record in &batch.conversations {
+        claim_id(database, record.id, "conversation")?;
+        let row = conversation_row(record)?;
+        database
+            .put("conversations", &serde_json::json!(record.id), &row)
+            .map_err(Error::message)?;
+    }
+    for record in &batch.entries {
+        claim_id(database, record.id, "entry")?;
+        let row = entry_row(record, batch.seq)?;
+        database
+            .put("entries", &serde_json::json!(record.id), &row)
+            .map_err(Error::message)?;
+    }
+    for record in &batch.tasks {
+        claim_id(database, record.id, "task")?;
+        let row = task_row(record)?;
+        database
+            .put("tasks", &serde_json::json!(record.id), &row)
+            .map_err(Error::message)?;
+    }
+    for record in &batch.submissions {
+        claim_id(database, record.id, "submission")?;
+        let row = submission_row(record)?;
+        database
+            .put("submissions", &serde_json::json!(record.id), &row)
+            .map_err(Error::message)?;
+    }
+    for document in &batch.documents {
+        write_document(database, document)?;
+    }
+    Ok(())
+}
+
+fn write_document(database: &mut MemoryIdb, document: &DocumentWrite) -> Result<(), Error> {
+    if document.inserted {
+        claim_id(database, document.record.id, "document")?;
+    }
+    let row = document_row(&document.record)?;
+    database
+        .put(
+            "documents",
+            &serde_json::json!(document.record.id),
+            &row,
+        )
+        .map_err(Error::message)?;
+    if document.replace_revisions {
+        delete_revisions(database, document.record.id)?;
+    }
+    for revision in &document.revisions {
+        let row = revision_row(document.record.id, revision)?;
+        database
+            .put(
+                "document_revisions",
+                &serde_json::json!([document.record.id, revision.seq]),
+                &row,
+            )
+            .map_err(Error::message)?;
+    }
+    Ok(())
+}
+
+fn conversation_row(record: &ConversationRecord) -> Result<Value, Error> {
+    let mut row = serde_json::Map::new();
+    row.insert("id".to_owned(), serde_json::json!(record.id));
+    if let Some(owner) = record.owner {
+        row.insert(
+            "ownerConversationId".to_owned(),
+            serde_json::json!(owner.conversation_id),
+        );
+        row.insert("ownerTaskId".to_owned(), serde_json::json!(owner.task_id));
+    }
+    row.insert("record".to_owned(), serde_json::to_value(record)?);
+    Ok(Value::Object(row))
+}
+
+fn entry_row(record: &EntryRecord, commit_seq: i64) -> Result<Value, Error> {
+    let mut row = serde_json::Map::new();
+    row.insert("id".to_owned(), serde_json::json!(record.id));
+    row.insert(
+        "conversationId".to_owned(),
+        serde_json::json!(record.conversation_id),
+    );
+    if record.head.is_some() {
+        row.insert(
+            "headConversationId".to_owned(),
+            serde_json::json!(record.conversation_id),
+        );
+    }
+    row.insert("commitSeq".to_owned(), serde_json::json!(commit_seq));
+    row.insert("record".to_owned(), serde_json::to_value(record)?);
+    Ok(Value::Object(row))
+}
+
+fn task_row(record: &TaskRecord) -> Result<Value, Error> {
+    let mut row = serde_json::Map::new();
+    row.insert("id".to_owned(), serde_json::json!(record.id));
+    row.insert(
+        "conversationId".to_owned(),
+        serde_json::json!(record.conversation_id),
+    );
+    row.insert("kind".to_owned(), serde_json::json!(record.kind));
+    row.insert(
+        "status".to_owned(),
+        serde_json::json!(record.state.status().to_string()),
+    );
+    row.insert(
+        "abortRequested".to_owned(),
+        serde_json::json!(record.abort_requested),
+    );
+    row.insert("background".to_owned(), serde_json::json!(record.background));
+    row.insert("record".to_owned(), serde_json::to_value(record)?);
+    Ok(Value::Object(row))
+}
+
+fn submission_row(record: &SubmissionRecord) -> Result<Value, Error> {
+    let mut row = serde_json::Map::new();
+    row.insert("id".to_owned(), serde_json::json!(record.id));
+    row.insert(
+        "conversationId".to_owned(),
+        serde_json::json!(record.conversation_id),
+    );
+    if let Some(request_id) = &record.request_id {
+        row.insert("requestId".to_owned(), serde_json::json!(request_id));
+    }
+    row.insert("status".to_owned(), serde_json::json!(record.status.to_string()));
+    row.insert("record".to_owned(), serde_json::to_value(record)?);
+    Ok(Value::Object(row))
+}
+
+fn document_row(record: &DocumentRecord) -> Result<Value, Error> {
+    let (scope_kind, owner_id) = scope_columns(&record.scope);
+    let mut row = serde_json::Map::new();
+    row.insert("id".to_owned(), serde_json::json!(record.id));
+    row.insert("kind".to_owned(), serde_json::json!(record.kind));
+    row.insert("scopeKind".to_owned(), serde_json::json!(scope_kind));
+    row.insert("ownerId".to_owned(), serde_json::json!(owner_id));
+    row.insert(
+        "family".to_owned(),
+        serde_json::json!(i64::from(record.key.is_some())),
+    );
+    row.insert(
+        "keyValue".to_owned(),
+        serde_json::json!(record.key.as_deref().unwrap_or("")),
+    );
+    row.insert("createdAt".to_owned(), serde_json::json!(record.created_at));
+    if let Some(retired_at) = record.retired_at {
+        row.insert("retiredAt".to_owned(), serde_json::json!(retired_at));
+    }
+    row.insert("record".to_owned(), serde_json::to_value(record)?);
+    Ok(Value::Object(row))
+}
+
+fn revision_row(document_id: i64, revision: &Revision) -> Result<Value, Error> {
+    let (kind, version, content) = match &revision.content {
+        DocumentContent::Base { version, value } => ("base", *version, value.clone()),
+        DocumentContent::Delta { version, ops } => ("delta", *version, serde_json::to_value(ops)?),
+    };
+    Ok(serde_json::json!({
+        "documentId": document_id,
+        "seq": revision.seq,
+        "kind": kind,
+        "version": version,
+        "content": content,
+    }))
+}
+
+fn scope_columns(scope: &DocumentScope) -> (&'static str, i64) {
+    match scope {
+        DocumentScope::Session => ("session", 0),
+        DocumentScope::Conversation { conversation_id } => ("conversation", *conversation_id),
+        DocumentScope::Task { task_id } => ("task", *task_id),
+    }
+}
+
+fn claim_id(database: &mut MemoryIdb, id: i64, kind: &str) -> Result<(), Error> {
+    let key = serde_json::json!(id);
+    if database
+        .get("record_ids", &key)
+        .map_err(Error::message)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    database
+        .put(
+            "record_ids",
+            &key,
+            &serde_json::json!({ "id": id, "recordType": kind }),
+        )
+        .map_err(Error::message)
+}
+
+fn store_meta(database: &mut MemoryIdb, next_id: i64, next_seq: i64) -> Result<(), Error> {
+    database
+        .put(
+            "meta",
+            &Value::String(META_KEY.to_owned()),
+            &serde_json::json!({
+                "key": META_KEY,
+                "nextId": next_id,
+                "nextSeq": next_seq,
+            }),
+        )
+        .map_err(Error::message)
+}
+
+fn delete_revisions(database: &mut MemoryIdb, document_id: i64) -> Result<(), Error> {
+    let rows = database
+        .values("document_revisions")
+        .map_err(Error::message)?;
+    for row in rows {
+        if row.get("documentId").and_then(Value::as_i64) != Some(document_id) {
+            continue;
+        }
+        let seq = require_i64(&row, "seq")?;
+        database
+            .delete("document_revisions", &serde_json::json!([document_id, seq]))
+            .map_err(Error::message)?;
+    }
+    Ok(())
+}
+
+/// Delete one conversation's rows. Children that point at `id` stay.
+fn delete_conversation_rows(database: &mut MemoryIdb, id: i64) -> Result<(), Error> {
+    if database
+        .get("conversations", &serde_json::json!(id))
+        .map_err(Error::message)?
+        .is_none()
+    {
+        return Err(Error::message(format!("Unknown conversation: {id}")));
+    }
+    let tasks = database.values("tasks").map_err(Error::message)?;
+    let mut task_ids = Vec::new();
+    for row in &tasks {
+        if row.get("conversationId").and_then(Value::as_i64) == Some(id) {
+            task_ids.push(require_i64(row, "id")?);
+        }
+    }
+    let documents = database.values("documents").map_err(Error::message)?;
+    let mut document_ids = Vec::new();
+    for row in &documents {
+        let scope = row.get("scopeKind").and_then(Value::as_str).unwrap_or("");
+        let owner = row.get("ownerId").and_then(Value::as_i64);
+        let owned = match (scope, owner) {
+            ("conversation", Some(owner)) if owner == id => true,
+            ("task", Some(owner)) if task_ids.contains(&owner) => true,
+            _ => false,
+        };
+        if owned {
+            document_ids.push(require_i64(row, "id")?);
+        }
+    }
+    for document_id in &document_ids {
+        delete_revisions(database, *document_id)?;
+        drop_record(database, "documents", *document_id)?;
+    }
+    drop_matching(database, "entries", id)?;
+    drop_matching(database, "tasks", id)?;
+    drop_matching(database, "submissions", id)?;
+    drop_record(database, "conversations", id)
+}
+
+fn drop_matching(database: &mut MemoryIdb, store: &str, conversation_id: i64) -> Result<(), Error> {
+    let rows = database.values(store).map_err(Error::message)?;
+    for row in rows {
+        if row.get("conversationId").and_then(Value::as_i64) != Some(conversation_id) {
+            continue;
+        }
+        drop_record(database, store, require_i64(&row, "id")?)?;
+    }
+    Ok(())
+}
+
+fn drop_record(database: &mut MemoryIdb, store: &str, id: i64) -> Result<(), Error> {
+    let key = serde_json::json!(id);
+    database.delete(store, &key).map_err(Error::message)?;
+    database
+        .delete("record_ids", &key)
+        .map_err(Error::message)
 }
 
 #[cfg(test)]
@@ -544,5 +1147,29 @@ mod tests {
             .get_all_by_index("tasks", "tasks_by_status", &serde_json::json!(["done", 1]))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn commit_reads_the_conversation_back() {
+        use crate::{ConversationRecord, Storage, StorageWrite, ROOT_CONVERSATION_ID};
+
+        let storage = IdbStorage::open("read-own-write").unwrap();
+        let written = ConversationRecord {
+            id: ROOT_CONVERSATION_ID,
+            parent: None,
+            owner: None,
+        };
+        assert_eq!(storage.conversation(written.id).unwrap(), None);
+        let committed = storage
+            .commit(
+                &[vec![StorageWrite::Conversation {
+                    value: written.clone(),
+                }]],
+                &mut |_index, _seq| {},
+            )
+            .unwrap();
+        assert_eq!(committed.stored, 1);
+        assert_eq!(committed.refused, None);
+        assert_eq!(storage.conversation(written.id).unwrap(), Some(written));
     }
 }
