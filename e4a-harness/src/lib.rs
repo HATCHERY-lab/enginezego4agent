@@ -2,6 +2,7 @@
 
 mod compaction;
 mod context;
+mod context_bounds;
 mod define;
 mod errors;
 mod generation;
@@ -28,6 +29,7 @@ mod view;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use context::{order_tool_results, Message};
+pub use context_bounds::{clamp_bounds, token_estimate, within, Bounds};
 pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use errors::error_chain;
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
