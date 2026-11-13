@@ -1,10 +1,14 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
+mod compaction;
+mod context;
 mod generation;
 mod scheduler;
 mod tool_task;
 mod usage;
 
+pub use compaction::{estimate_context, select_cut, serialize_conversation};
+pub use context::{order_tool_results, Message};
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
 pub use scheduler::{Scheduler, Waiter};
 pub use tool_task::ToolPhase;
