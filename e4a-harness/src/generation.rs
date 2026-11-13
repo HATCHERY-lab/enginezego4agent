@@ -9,7 +9,9 @@ use e4a_session::{
     EntryDraft, EntryRecord, Session, SubmissionCreate, SubmissionSettlement, SubmissionStatus,
     SubmissionType, TaskCreate, TaskRecord, TaskState, Tx,
 };
-use e4a_types::{EntryQuery, JoinPolicy, Json, ScanOrder, TaskOutcome, TaskOutcomeError};
+use e4a_types::{
+    coerce, EntryQuery, JoinPolicy, Json, ScanOrder, TaskOutcome, TaskOutcomeError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -760,6 +762,17 @@ async fn drain(stream: &mut EventStream) -> Result<Vec<LlmEvent>, Error> {
     Ok(events)
 }
 
+/// Stored arguments follow the offered tool schema. No matching name leaves them unchanged.
+fn coerced_arguments(task: &TaskRecord, call: &ToolCall) -> Json {
+    let Ok(input) = serde_json::from_value::<GenerationInput>(task.input.clone()) else {
+        return call.arguments.clone();
+    };
+    let Some(tool) = input.tools.iter().find(|tool| tool.name == call.name) else {
+        return call.arguments.clone();
+    };
+    coerce(&tool.parameters, &call.arguments)
+}
+
 fn commit_answer(
     tx: &mut Tx,
     generation: &Generation,
@@ -773,11 +786,12 @@ fn commit_answer(
         content.push(json!({ "type": "text", "text": answer.text }));
     }
     if let Some(call) = &answer.tool {
+        let arguments = coerced_arguments(&task, call);
         content.push(json!({
             "type": "toolCall",
             "id": call.id,
             "name": call.name,
-            "arguments": call.arguments,
+            "arguments": arguments,
         }));
     }
     let stop_reason = if answer.tool.is_some() {
