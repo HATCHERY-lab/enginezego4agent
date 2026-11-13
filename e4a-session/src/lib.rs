@@ -5,6 +5,7 @@
 mod docs;
 mod forks;
 mod keys;
+mod live;
 mod lookup;
 mod session;
 mod store;
@@ -14,6 +15,9 @@ mod view;
 pub use docs::{
     agent_doc, compaction_fields, provider_doc, address_id, Checkpoint, CompactionSettings, DocDef,
     DocRef, DocScopeKind, AGENT_KIND, PROVIDER_KIND,
+};
+pub use live::{
+    cut_off_count, cut_off_too_often, salvageable, RunFailureReason, LIMIT_RESTARTS,
 };
 pub use lookup::task_conversation_id;
 pub use session::{Session, SessionEnd};
