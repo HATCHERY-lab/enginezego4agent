@@ -4,6 +4,7 @@
 //! [`LocalEnv::exec`] runs `powershell` on Windows and `bash` elsewhere,
 //! with the working directory inside that root.
 
+pub mod node_io;
 pub mod watch;
 
 use std::ffi::{OsStr, OsString};
