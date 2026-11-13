@@ -7,6 +7,7 @@ description = "Filesystem tools for engine4agent"
 publish = false
 
 [dependencies]
+e4a-codemode = { path = "../e4a-codemode" }
 e4a-harness = { path = "../e4a-harness" }
 e4a-llm = { path = "../e4a-llm" }
 e4a-session = { path = "../e4a-session" }

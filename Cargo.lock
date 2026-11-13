@@ -414,6 +414,7 @@ dependencies = [
 name = "e4a-tools"
 version = "0.1.0"
 dependencies = [
+ "e4a-codemode",
  "e4a-harness",
  "e4a-llm",
  "e4a-session",

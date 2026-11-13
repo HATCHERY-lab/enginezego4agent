@@ -26,7 +26,7 @@ pub struct ToolEffect {
     pub content: String,
 }
 
-/// Root directory for `read`, `write`, `edit`, and `edit_all`.
+/// Root directory for `read`, `write`, `edit`, `edit_all`, `code`, and `resize`.
 ///
 /// Every path is canonicalized and must stay inside [`Self::root`]. `read` and
 /// `edit` refuse files larger than 256 KiB and files that are not UTF-8.
@@ -143,7 +143,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Dispatch `read`, `write`, `edit`, `edit_all`, `bash`, or `powershell`.
+    /// Dispatch `read`, `write`, `edit`, `edit_all`, `bash`, `powershell`, `code`, or `resize`.
     /// An unknown name is an error result.
     pub fn call(&self, name: &str, arguments: &Json) -> ToolEffect {
         match self.execute(name, arguments) {
@@ -186,6 +186,23 @@ impl Workspace {
             }
             "bash" => crate::shell::bash(&self.root, arguments),
             "powershell" => crate::shell::powershell(&self.root, arguments),
+            "code" => {
+                let script = arg(arguments, "script")?;
+                e4a_codemode::eval(script).map_err(Error::message)
+            }
+            "resize" => {
+                let path = arg(arguments, "path")?;
+                let w = arg_u32(arguments, "w")?;
+                let h = arg_u32(arguments, "h")?;
+                let resolved = self.resolve(path)?;
+                let bytes = read_bytes(&self.root, &resolved)?;
+                crate::photon::plan(
+                    crate::photon::PhotonOp::Resize { w, h },
+                    bytes.len() as u64,
+                )
+                .map_err(Error::message)?;
+                finish_resize(&self.root, path, &resolved, &bytes, w, h)
+            }
             other => Err(Error::message(format!("unknown tool {other}"))),
         }
     }
@@ -248,6 +265,67 @@ fn arg<'a>(arguments: &'a Json, key: &str) -> Result<&'a str, Error> {
         Some(_) => Err(Error::message(format!("{key} must be a string"))),
         None => Err(Error::message(format!("{key} is required"))),
     }
+}
+
+fn arg_u32(arguments: &Json, key: &str) -> Result<u32, Error> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| Error::message("arguments must be an object"))?;
+    match object.get(key) {
+        Some(Json::Number(number)) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| Error::message(format!("{key} must fit in u32"))),
+        Some(_) => Err(Error::message(format!("{key} must be an integer"))),
+        None => Err(Error::message(format!("{key} is required"))),
+    }
+}
+
+/// One past the image plan cap, so an oversized file still reaches `plan`.
+const MAX_IMAGE_READ: u64 = 5_000_001;
+
+fn read_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, Error> {
+    if path == root || !path.starts_with(root) {
+        return Err(Error::message("path escapes the workspace"));
+    }
+    let file = File::open(path).map_err(|err| Error::message(format!("cannot read file: {err}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| Error::message(format!("cannot read file: {err}")))?;
+    if !meta.is_file() {
+        return Err(Error::message("path is not a file"));
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_IMAGE_READ)
+        .read_to_end(&mut buf)
+        .map_err(|err| Error::message(format!("cannot read file: {err}")))?;
+    Ok(buf)
+}
+
+#[cfg(feature = "photon")]
+fn finish_resize(
+    root: &Path,
+    path: &str,
+    resolved: &Path,
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<String, Error> {
+    let png = crate::photon::resize_png(bytes, w, h).map_err(Error::message)?;
+    write_bytes(root, resolved, &png)?;
+    Ok(format!("resized {path}"))
+}
+
+#[cfg(not(feature = "photon"))]
+fn finish_resize(
+    _root: &Path,
+    _path: &str,
+    _resolved: &Path,
+    _bytes: &[u8],
+    _w: u32,
+    _h: u32,
+) -> Result<String, Error> {
+    Err(Error::message("photon wasm not linked"))
 }
 
 fn existing_anchor(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>), Error> {
@@ -317,6 +395,10 @@ fn read_text(path: &Path) -> Result<String, Error> {
 }
 
 fn write_file(root: &Path, path: &Path, content: &str) -> Result<(), Error> {
+    write_bytes(root, path, content.as_bytes())
+}
+
+fn write_bytes(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), Error> {
     if path == root || !path.starts_with(root) {
         return Err(Error::message("path escapes the workspace"));
     }
@@ -328,6 +410,64 @@ fn write_file(root: &Path, path: &Path, content: &str) -> Result<(), Error> {
     }
     std::fs::create_dir_all(parent)
         .map_err(|err| Error::message(format!("cannot create parent directory: {err}")))?;
-    std::fs::write(path, content.as_bytes())
-        .map_err(|err| Error::message(format!("cannot write file: {err}")))
+    std::fs::write(path, bytes).map_err(|err| Error::message(format!("cannot write file: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+
+    use super::Workspace;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "e4a-tools-workspace-{}-{}",
+                std::process::id(),
+                nanos
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn code_is_unlinked_and_zero_resize_fails_in_plan() {
+        let scratch = Scratch::new();
+        let workspace = Workspace::new(&scratch.0).unwrap();
+        let code = workspace.call("code", &json!({ "script": "1" }));
+        assert!(code.is_error, "{}", code.content);
+        assert!(
+            code.content.contains("js runtime not linked"),
+            "{}",
+            code.content
+        );
+        fs::write(scratch.0.join("shot.png"), b"png").unwrap();
+        let resized = workspace.call(
+            "resize",
+            &json!({ "path": "shot.png", "w": 0, "h": 4 }),
+        );
+        assert!(resized.is_error, "{}", resized.content);
+        assert!(
+            resized.content.contains("resize dimension is zero"),
+            "{}",
+            resized.content
+        );
+    }
 }
