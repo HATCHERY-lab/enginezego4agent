@@ -1,4 +1,4 @@
-//! engine4agent photon plan, wasm not linked.
+//! engine4agent photon plan. photon-rs is linked only with the `photon` feature.
 
 /// One Photon image op. Planning does not decode pixels or link the wasm runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,9 +25,36 @@ pub fn plan(op: PhotonOp, byte_len: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Report that the Photon wasm module is not linked.
+/// Name the Photon runtime this build links.
+///
+/// `"photon-rs"` when the `photon` feature is on. Otherwise the wasm module
+/// is not linked.
 pub fn runtime() -> &'static str {
-    "photon wasm not linked"
+    if cfg!(feature = "photon") {
+        "photon-rs"
+    } else {
+        "photon wasm not linked"
+    }
+}
+
+/// Open `bytes` with photon-rs, resize to `w` by `h`, and return PNG bytes.
+///
+/// `w` or `h` of `0` is an error before decode. A photon-rs failure is returned
+/// as that error's text. Sampling is Lanczos3.
+#[cfg(feature = "photon")]
+pub fn resize_png(bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+    if w == 0 || h == 0 {
+        return Err("resize dimension is zero".to_string());
+    }
+    let image =
+        photon_rs::native::open_image_from_bytes(bytes).map_err(|error| error.to_string())?;
+    let resized = photon_rs::transform::resize(
+        &image,
+        w,
+        h,
+        photon_rs::transform::SamplingFilter::Lanczos3,
+    );
+    Ok(resized.get_bytes())
 }
 
 #[cfg(test)]
@@ -75,8 +102,28 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "photon"))]
     #[test]
     fn runtime_is_unlinked() {
         assert_eq!(runtime(), "photon wasm not linked");
+    }
+
+    #[cfg(feature = "photon")]
+    #[test]
+    fn runtime_names_photon_rs() {
+        assert_eq!(runtime(), "photon-rs");
+    }
+
+    #[cfg(feature = "photon")]
+    #[test]
+    fn resize_png_refuses_a_zero_dimension_before_decode() {
+        assert_eq!(
+            super::resize_png(&[], 0, 8).unwrap_err(),
+            "resize dimension is zero"
+        );
+        assert_eq!(
+            super::resize_png(&[1, 2, 3], 8, 0).unwrap_err(),
+            "resize dimension is zero"
+        );
     }
 }
