@@ -18,6 +18,7 @@ mod provider;
 mod registry;
 mod run_state;
 mod scheduler;
+mod scheduler_js;
 mod search;
 mod submissions;
 mod telemetry;
@@ -58,6 +59,7 @@ pub use run_state::{
     BlockedSubject, Invocation, RegisteredDefinition, RunEvent, RunPhase,
 };
 pub use scheduler::{Scheduler, Waiter};
+pub use scheduler_js::{migrate, note_crash, pick_ready, request_abort, Task};
 pub use search::find_line;
 pub use submissions::{admit, withdraw_kind, Submission};
 pub use telemetry::TELEMETRY_SCHEMA;
