@@ -1,0 +1,8 @@
+node_modules/
+work/
+*.log
+*.sqlite
+*.sqlite-*
+*.err
+/target
+

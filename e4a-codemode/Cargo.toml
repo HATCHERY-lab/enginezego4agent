@@ -1,0 +1,21 @@
+[package]
+name = "e4a-codemode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Code-mode tool protocol for engine4agent"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# Same pins as uzor-anim-js. Optional: a normal check does not compile QuickJS.
+# No network feature. `compiler` lives on the runtime crate; without a JIT
+# attach the engine is still the interpreter.
+rquickjs = { package = "quickjs-jit", version = "=0.14.1", default-features = false, features = ["std", "jit-abi", "loader"], optional = true }
+rquickjs-jit = { package = "quickjs-jit-runtime", version = "=0.14.1", features = ["compiler"], optional = true }
+
+[features]
+default = []
+quickjs = ["dep:rquickjs", "dep:rquickjs-jit"]

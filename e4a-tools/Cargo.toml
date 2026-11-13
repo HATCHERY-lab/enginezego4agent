@@ -1,0 +1,26 @@
+[package]
+name = "e4a-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem tools for engine4agent"
+publish = false
+
+[dependencies]
+e4a-codemode = { path = "../e4a-codemode" }
+e4a-env = { path = "../e4a-env" }
+e4a-harness = { path = "../e4a-harness" }
+e4a-llm = { path = "../e4a-llm" }
+e4a-session = { path = "../e4a-session" }
+e4a-types = { path = "../e4a-types" }
+serde_json = "1"
+thiserror = "1"
+# Optional: a normal check does not compile photon-rs (native image codecs).
+photon-rs = { version = "0.3", optional = true }
+
+[features]
+default = []
+photon = ["dep:photon-rs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
