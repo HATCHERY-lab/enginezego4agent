@@ -37,6 +37,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "e4a-harness"
+version = "0.1.0"
+dependencies = [
+ "e4a-llm",
+ "e4a-session",
+ "e4a-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "e4a-llm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "e4a-session"
 version = "0.1.0"
 dependencies = [
