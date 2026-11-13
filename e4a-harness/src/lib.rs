@@ -21,6 +21,7 @@ mod run_state;
 mod scheduler;
 mod scheduler_js;
 mod search;
+mod signals;
 mod submissions;
 mod telemetry;
 mod timers;
@@ -65,6 +66,7 @@ pub use run_state::{
 pub use scheduler::{Scheduler, Waiter};
 pub use scheduler_js::{migrate, note_crash, pick_ready, request_abort, Task};
 pub use search::find_line;
+pub use signals::{cancel_waits, park, resume, signal, Signal};
 pub use submissions::{admit, withdraw_kind, Submission};
 pub use telemetry::TELEMETRY_SCHEMA;
 pub use timers::backoff_ms;
