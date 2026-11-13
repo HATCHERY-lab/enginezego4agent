@@ -3,11 +3,13 @@
 //! Durable storage records. IDs share one integer namespace. Conversation 1 is the root.
 
 mod apply;
+mod coerce;
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub use apply::{apply, ApplyError, Op, Path, Seg};
+pub use coerce::coerce;
 
 pub type Json = serde_json::Value;
 
