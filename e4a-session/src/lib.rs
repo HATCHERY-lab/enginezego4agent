@@ -2,6 +2,7 @@
 
 //! Session kernel: one mutation line, group-commit writer thread, publication of committed state.
 
+mod cache;
 mod docs;
 mod forks;
 mod keys;
@@ -13,6 +14,7 @@ mod tails;
 mod tx;
 mod view;
 
+pub use cache::{admits, evict_oldest, Cache};
 pub use docs::{
     agent_doc, compaction_fields, provider_doc, address_id, Checkpoint, CompactionSettings, DocDef,
     DocRef, DocScopeKind, AGENT_KIND, PROVIDER_KIND,
