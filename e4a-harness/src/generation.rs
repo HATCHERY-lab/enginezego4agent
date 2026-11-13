@@ -15,6 +15,9 @@ use e4a_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::compact_hook::compact_if_needed;
+use crate::compaction_job::Settings;
+use crate::context_load::Line;
 use crate::generation_plan::{plan, stop_reason, PlanStep};
 use crate::tool_path::run_tool_round;
 use crate::usage::record_usage;
@@ -245,6 +248,22 @@ impl Generation {
                 let entry_id = session
                     .commit(|tx| commit_answer(tx, self, &checkpoint, &answer))
                     .await?;
+                if answer.tool.is_none() {
+                    let lines = [Line {
+                        entry_id,
+                        text: answer.text.clone(),
+                    }];
+                    let estimated_tokens = u64::try_from(answer.usage.input_tokens)
+                        .unwrap_or(0)
+                        .saturating_add(u64::try_from(answer.usage.output_tokens).unwrap_or(0));
+                    let settings = Settings::default();
+                    match compact_if_needed(llm, &lines, estimated_tokens, 200_000, &settings)
+                        .await
+                    {
+                        Ok(None) | Ok(Some(_)) => {}
+                        Err(message) => return Err(Error::message(message)),
+                    }
+                }
                 let failed_attempts = session
                     .task(self.task_id)
                     .await?

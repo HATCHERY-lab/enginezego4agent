@@ -56,6 +56,9 @@ mod view_sub;
 mod provider_close;
 mod scheduler_loop;
 mod gate;
+mod compact_hook;
+mod advisor_turn;
+mod view_follow;
 
 pub use advisor::advisor_tools;
 pub use advisor_agent::{advisor_agent, advisor_fallback};
@@ -124,6 +127,10 @@ pub use provider_close::ProviderSessions;
 pub use scheduler_loop::{crash_task, drive_pass};
 pub use gate::Gate;
 pub use provider_close::shutdown;
+pub use compact_hook::compact_if_needed;
+pub use advisor_turn::advise;
+pub use view_follow::follow_lines;
+pub use broker::resolve;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
