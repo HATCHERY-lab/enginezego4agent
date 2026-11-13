@@ -12,6 +12,7 @@ mod session;
 mod store;
 mod tails;
 mod tx;
+mod tx_ops;
 mod view;
 
 pub use cache::{admits, evict_oldest, Cache};
@@ -28,6 +29,7 @@ pub use session::{Session, SessionEnd};
 pub use tx::{
     ConversationOwnership, EntryDraft, SubmissionCreate, SubmissionSettlement, TaskCreate, Tx,
 };
+pub use tx_ops::{append_entry, apply_order, note_usage, set_task_state, TxOp};
 pub use view::{ConversationView, ConversationWindow};
 
 pub use e4a_types::{
