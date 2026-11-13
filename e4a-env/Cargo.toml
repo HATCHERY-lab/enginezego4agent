@@ -7,4 +7,5 @@ description = "Local execution environment for engine4agent"
 publish = false
 
 [dependencies]
+notify = { version = "6", default-features = true }
 thiserror = "1"
