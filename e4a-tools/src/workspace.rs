@@ -1,12 +1,16 @@
 //! Filesystem tools jailed to one canonical root.
 //! `edit` replaces one exact non-overlapping copy of `old`. It is not a diff.
+//! `edit_all` replaces every non-overlapping copy.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use e4a_types::Json;
 
+use crate::edit_diff::apply_hunks;
+use crate::mutation_queue::{Mutation, MutationKind, Queue};
 use crate::Error;
 
 /// Largest file `read` or `edit` will load.
@@ -22,14 +26,29 @@ pub struct ToolEffect {
     pub content: String,
 }
 
-/// Root directory for `read`, `write`, and `edit`.
+/// Root directory for `read`, `write`, `edit`, and `edit_all`.
 ///
 /// Every path is canonicalized and must stay inside [`Self::root`]. `read` and
 /// `edit` refuse files larger than 256 KiB and files that are not UTF-8.
-/// `edit` errors when `old` occurs zero times or more than once.
-#[derive(Clone, Debug)]
+/// `edit` errors when `old` occurs zero times or more than once. `edit_all`
+/// errors when `old` is empty or occurs zero times.
+/// A successful `write` records [`MutationKind::Write`]. A successful `edit`
+/// or `edit_all` records one [`MutationKind::Edit`]. Jail failures and other
+/// errors record nothing.
+#[derive(Debug)]
 pub struct Workspace {
     root: PathBuf,
+    queue: Mutex<Queue>,
+}
+
+impl Clone for Workspace {
+    fn clone(&self) -> Self {
+        let queue = self.lock_queue().clone();
+        Self {
+            root: self.root.clone(),
+            queue: Mutex::new(queue),
+        }
+    }
 }
 
 impl Workspace {
@@ -48,11 +67,22 @@ impl Workspace {
         let root = requested.canonicalize().map_err(|err| {
             Error::message(format!("workspace root {}: {err}", requested.display()))
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            queue: Mutex::new(Queue::default()),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Mutations from successful `write`, `edit`, and `edit_all` calls.
+    ///
+    /// Drop the guard before those methods. They lock this same mutex.
+    /// A poisoned lock still returns the queue.
+    pub fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.lock_queue()
     }
 
     /// UTF-8 text of one file inside the root.
@@ -62,15 +92,20 @@ impl Workspace {
     }
 
     /// Create parent directories inside the root and overwrite the file.
+    ///
+    /// On success, records [`MutationKind::Write`] for `path`.
     pub fn write(&self, path: &str, content: &str) -> Result<(), Error> {
         let resolved = self.resolve(path)?;
-        write_file(&self.root, &resolved, content)
+        write_file(&self.root, &resolved, content)?;
+        self.record(path, MutationKind::Write);
+        Ok(())
     }
 
     /// Replace the single exact occurrence of `old` with `new`.
     ///
     /// Matches do not overlap. An empty `old` is an error. The file is left
-    /// unchanged when the occurrence count is not exactly one.
+    /// unchanged when the occurrence count is not exactly one. On success,
+    /// records one [`MutationKind::Edit`] for `path`.
     pub fn edit(&self, path: &str, old: &str, new: &str) -> Result<(), Error> {
         if old.is_empty() {
             return Err(Error::message("old string is empty"));
@@ -87,10 +122,28 @@ impl Workspace {
             )));
         }
         let updated = text.replacen(old, new, 1);
-        write_file(&self.root, &resolved, &updated)
+        write_file(&self.root, &resolved, &updated)?;
+        self.record(path, MutationKind::Edit);
+        Ok(())
     }
 
-    /// Dispatch `read`, `write`, `edit`, `bash`, or `powershell`.
+    /// Replace every non-overlapping occurrence of `old` with `new`.
+    ///
+    /// An empty `old` is an error. Zero occurrences is an error and the file
+    /// is left unchanged. On success, records one [`MutationKind::Edit`].
+    pub fn edit_all(&self, path: &str, old: &str, new: &str) -> Result<(), Error> {
+        if old.is_empty() {
+            return Err(Error::message("old string is empty"));
+        }
+        let resolved = self.resolve(path)?;
+        let text = read_text(&resolved)?;
+        let updated = apply_hunks(&text, old, new).map_err(Error::message)?;
+        write_file(&self.root, &resolved, &updated)?;
+        self.record(path, MutationKind::Edit);
+        Ok(())
+    }
+
+    /// Dispatch `read`, `write`, `edit`, `edit_all`, `bash`, or `powershell`.
     /// An unknown name is an error result.
     pub fn call(&self, name: &str, arguments: &Json) -> ToolEffect {
         match self.execute(name, arguments) {
@@ -122,6 +175,13 @@ impl Workspace {
                 let old = arg(arguments, "old")?;
                 let new = arg(arguments, "new")?;
                 self.edit(path, old, new)?;
+                Ok(format!("edited {path}"))
+            }
+            "edit_all" => {
+                let path = arg(arguments, "path")?;
+                let old = arg(arguments, "old")?;
+                let new = arg(arguments, "new")?;
+                self.edit_all(path, old, new)?;
                 Ok(format!("edited {path}"))
             }
             "bash" => crate::shell::bash(&self.root, arguments),
@@ -158,6 +218,24 @@ impl Workspace {
             }
         }
         Ok(full)
+    }
+
+    fn lock_queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record `path` as the caller wrote it. An empty path is not queued.
+    /// Call only after the filesystem change has succeeded.
+    fn record(&self, path: &str, kind: MutationKind) {
+        if path.is_empty() {
+            return;
+        }
+        let _ = self.lock_queue().push(Mutation {
+            path: path.to_string(),
+            kind,
+        });
     }
 }
 
