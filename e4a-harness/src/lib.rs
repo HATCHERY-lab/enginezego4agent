@@ -33,6 +33,7 @@ mod transcript;
 mod truncate;
 mod usage;
 mod view;
+mod view_sub;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
@@ -77,6 +78,7 @@ pub use transcript::{render, visible_lines, TranscriptLine};
 pub use truncate::truncate_chars;
 pub use usage::usage_doc;
 pub use view::window;
+pub use view_sub::on_lines;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
