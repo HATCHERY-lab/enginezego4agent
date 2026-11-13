@@ -179,6 +179,7 @@ async fn run_waiting_gated<L: Llm>(
             }
         }
     };
+    e4a_harness::signal_turn(generation_task_id)?;
     let entry_id = session
         .commit(|tx| commit_tool_result(tx, &pending, &effect))
         .await?;

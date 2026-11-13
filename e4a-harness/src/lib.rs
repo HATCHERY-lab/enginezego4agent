@@ -59,6 +59,7 @@ mod gate;
 mod compact_hook;
 mod advisor_turn;
 mod view_follow;
+mod gate_board;
 
 pub use advisor::advisor_tools;
 pub use advisor_agent::{advisor_agent, advisor_fallback};
@@ -131,6 +132,7 @@ pub use compact_hook::compact_if_needed;
 pub use advisor_turn::advise;
 pub use view_follow::follow_lines;
 pub use broker::resolve;
+pub use gate_board::{park_turn, signal_turn};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]

@@ -249,6 +249,25 @@ impl Session {
             .call(move |storage| storage.submission(id).map_err(Error::from))
     }
 
+    /// Tasks stored for one conversation. This does not delete them.
+    pub async fn list_tasks(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<e4a_types::TaskRecord>, Error> {
+        let _line = self.inner.line.lock().await;
+        self.assert_usable()?;
+        let query = TaskQuery {
+            conversation_id: Some(conversation_id),
+            ..TaskQuery::default()
+        };
+        self.inner.store.call(move |storage| {
+            let page = storage
+                .scan_tasks(&query, usize::MAX, None)
+                .map_err(Error::from)?;
+            Ok(page.items)
+        })
+    }
+
     /// Permanently delete a conversation on the store writer thread.
     ///
     /// Root conversation 1 is refused. Children that point at `id` as parent stay;

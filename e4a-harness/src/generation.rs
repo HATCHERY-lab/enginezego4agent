@@ -10,7 +10,7 @@ use e4a_session::{
     SubmissionType, TaskCreate, TaskRecord, TaskState, Tx,
 };
 use e4a_types::{
-    coerce, EntryQuery, JoinPolicy, Json, ScanOrder, TaskOutcome, TaskOutcomeError,
+    coerce, AbortReason, EntryQuery, JoinPolicy, Json, ScanOrder, TaskOutcome, TaskOutcomeError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -68,6 +68,7 @@ pub struct TurnOutcome {
     pub failed_attempts: i64,
     pub called_llm: bool,
     pub kind: TurnKind,
+    pub tail: Vec<String>,
 }
 
 /// Durable generation task. The model call is never inside [`Session::commit`].
@@ -241,25 +242,10 @@ impl Generation {
                 let request = session
                     .commit(|tx| turn_request(tx, self, &checkpoint))
                     .await?;
-                let mut gate = crate::gate::Gate::open("turn").map_err(Error::message)?;
-                gate.park(self.task_id, "model").map_err(Error::message)?;
-                let collected = collect_answer(llm, &request).await;
-                let signaled = gate.signal("done");
-                let phase = gate.cancel(self.task_id);
-                let stored = gate.take_error(self.task_id);
-                if let Err(message) = signaled {
-                    return Err(Error::message(message));
+                let answer = collect_answer(llm, &request).await.map_err(failed_model)?;
+                if answer.tool.is_some() {
+                    crate::gate_board::park_turn(self.task_id)?;
                 }
-                if phase != "cancel" || stored.is_none() {
-                    return Err(Error::message(format!(
-                        "gate phase is {phase}, error missing: {}",
-                        stored.is_none()
-                    )));
-                }
-                let answer = match collected {
-                    Ok(answer) => answer,
-                    Err(err) => return Err(failed_model(err)),
-                };
                 let entry_id = session
                     .commit(|tx| commit_answer(tx, self, &checkpoint, &answer))
                     .await?;
@@ -306,25 +292,15 @@ impl Generation {
                 session
                     .commit_live(self.conversation_id, self.task_id, &slots, ended)
                     .await?;
-                let _tail = crate::view_follow::follow_lines(session, self.conversation_id, 50)
+                let tail = crate::view_follow::follow_lines(session, self.conversation_id, 50)
                     .await
                     .map_err(Error::message)?;
-                let task = crate::scheduler_js::Task {
-                    id: self.task_id,
-                    kind: "generation".to_owned(),
-                    state: "idle".to_owned(),
-                    version: 1,
-                    abort_requested: false,
-                    abort_reason: String::new(),
-                    attempt: 0,
-                };
+                let rows = session.list_tasks(self.conversation_id).await?;
+                let scheduled: Vec<crate::scheduler_js::Task> =
+                    rows.iter().map(scheduler_task).collect();
                 let mut pending = crate::notify_pass::PendingPass::default();
-                let ready = crate::scheduler_loop::drive_pass(&mut pending, &[task], |pending| {
-                    pending.notify_runnable(self.task_id)
-                });
-                if ready != Some(self.task_id) {
-                    return Err(Error::message("scheduler pass dropped the task"));
-                }
+                let ready = crate::scheduler_loop::drive_pass(&mut pending, &scheduled, |_| {});
+                start_ready(session, &rows, ready).await?;
                 let failed_attempts = session
                     .task(self.task_id)
                     .await?
@@ -344,6 +320,7 @@ impl Generation {
                     failed_attempts,
                     called_llm: true,
                     kind,
+                    tail,
                 })
             }
         }
@@ -364,6 +341,7 @@ impl Generation {
             failed_attempts: checkpoint.failed_attempts,
             called_llm,
             kind: TurnKind::Answered { entry_id },
+            tail: Vec::new(),
         })
     }
 
@@ -373,6 +351,7 @@ impl Generation {
             failed_attempts,
             called_llm: false,
             kind: TurnKind::RestartLimit,
+            tail: Vec::new(),
         }
     }
 }
@@ -495,6 +474,7 @@ fn terminal_outcome(
         failed_attempts,
         called_llm: false,
         kind,
+        tail: Vec::new(),
     })
 }
 
@@ -521,6 +501,7 @@ fn waiting_outcome(
             entry_id,
             tool_task_id,
         },
+        tail: Vec::new(),
     })
 }
 
@@ -590,9 +571,18 @@ fn turn_request(
         ));
     }
     let entries = conversation_entries(tx, generation.conversation_id)?;
+    let covered = entries
+        .iter()
+        .filter(|entry| entry.kind == "pi.compaction" && entry.id <= checkpoint.cutoff)
+        .filter_map(|entry| entry.head)
+        .max();
     let messages = entries
         .into_iter()
         .filter(|entry| entry.id <= checkpoint.cutoff)
+        .filter(|entry| match covered {
+            Some(head) => entry.kind == "pi.compaction" || entry.id > head,
+            None => true,
+        })
         .filter_map(|entry| message_from_entry(&entry))
         .collect::<Vec<_>>();
     if messages.is_empty() {
@@ -1056,6 +1046,55 @@ fn settle_from(
         },
     };
     tx.set_task(task)?;
+    Ok(())
+}
+
+fn scheduler_task(record: &TaskRecord) -> crate::scheduler_js::Task {
+    crate::scheduler_js::Task {
+        id: record.id,
+        kind: record.kind.clone(),
+        state: scheduler_state(&record.state).to_owned(),
+        version: record.version,
+        abort_requested: record.abort_requested,
+        abort_reason: match record.abort_reason {
+            Some(AbortReason::Restart) => "restart".to_owned(),
+            None => String::new(),
+        },
+        attempt: 0,
+    }
+}
+
+fn scheduler_state(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Pending { .. } => "idle",
+        TaskState::Running { .. } => "running",
+        TaskState::Waiting { .. } | TaskState::Sleeping { .. } => "waiting",
+        TaskState::Completing { .. } | TaskState::Terminal { .. } => "done",
+    }
+}
+
+async fn start_ready(
+    session: &Session,
+    rows: &[TaskRecord],
+    ready: Option<i64>,
+) -> Result<(), Error> {
+    let Some(ready_id) = ready else {
+        return Ok(());
+    };
+    let Some(row) = rows.iter().find(|task| task.id == ready_id) else {
+        return Err(Error::message(format!("task {ready_id} does not exist")));
+    };
+    let mut running = row.clone();
+    let TaskState::Pending { checkpoint } = running.state else {
+        return Ok(());
+    };
+    running.state = TaskState::Running { checkpoint };
+    session
+        .commit(move |tx| {
+            tx.set_task(running)?;
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
