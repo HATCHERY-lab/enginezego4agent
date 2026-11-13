@@ -1,0 +1,12 @@
+[package]
+name = "e4a-codemode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Code-mode tool protocol for engine4agent"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
