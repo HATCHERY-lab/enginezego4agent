@@ -5,12 +5,14 @@
 mod coerce;
 mod edit_diff;
 mod image_guard;
+mod mutation_queue;
 mod shell;
 mod workspace;
 
 pub use coerce::coerce;
 pub use edit_diff::apply_hunks;
 pub use image_guard::image_refusal;
+pub use mutation_queue::{EmptyPath, Mutation, MutationKind, Queue};
 pub use workspace::{ToolEffect, Workspace};
 
 use e4a_harness::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP};
