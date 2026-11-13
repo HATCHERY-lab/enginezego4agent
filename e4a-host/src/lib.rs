@@ -2,8 +2,10 @@
 
 //! Newline-delimited JSON-RPC on stdin and stdout.
 //!
-//! This process does not open a socket, read a key, or open a file store.
-//! [`handle_line`] runs `session/prompt` as one in-memory faux turn.
+//! This process does not open a socket or a file store, and it does not print a key.
+//! [`handle_line`] runs `session/prompt` as one in-memory faux turn unless both
+//! `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty. That case returns
+//! JSON-RPC `-32000` and does not dial.
 
 use e4a_harness::{Generation, TurnInput, TurnKind};
 use e4a_llm::{FauxLlm, Usage};
@@ -60,7 +62,9 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// Known methods return one JSON-RPC line ending in `\n`.
 ///
 /// `session/prompt` with one text block runs one faux generation and returns
-/// `{stopReason:"end_turn", text}`. Missing prompt text is JSON-RPC `-32602`.
+/// `{stopReason:"end_turn", text}` when [`prompt_backend`] is `faux`.
+/// When both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty, the reply is
+/// JSON-RPC `-32000` and nothing is dialed. Missing prompt text is JSON-RPC `-32602`.
 pub fn handle_line(line: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
@@ -103,6 +107,12 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
     let Some(user_text) = prompt_text(params) else {
         return rpc_error(id, -32602, "prompt must be one non-empty text block");
     };
+    let socks = std::env::var("E4A_SOCKS").ok();
+    let key = std::env::var("E4A_OPENROUTER_KEY").ok();
+    if prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter" {
+        // Dial is the next slice. The key stays in this frame and is not copied into the reply.
+        return rpc_error(id, -32000, "openrouter dial is the next slice");
+    }
     // Sync stdin loop: one current-thread runtime for this turn, no process and no network.
     let runtime = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(runtime) => runtime,
@@ -111,6 +121,16 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
     match runtime.block_on(faux_prompt(user_text)) {
         Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
         Err(err) => rpc_error(id, -32603, &err),
+    }
+}
+
+/// `openrouter` only when both `socks` and `key` are non-empty. Otherwise `faux`.
+///
+/// Does not read the process environment and does not dial.
+fn prompt_backend(socks: Option<&str>, key: Option<&str>) -> &'static str {
+    match (socks, key) {
+        (Some(socks), Some(key)) if !socks.is_empty() && !key.is_empty() => "openrouter",
+        _ => "faux",
     }
 }
 
@@ -252,6 +272,22 @@ mod tests {
             let value = parse_reply(&reply);
             assert_eq!(value["error"]["code"], json!(-32602));
         }
+    }
+
+    #[test]
+    fn prompt_backend_is_openrouter_only_when_both_are_set() {
+        assert_eq!(prompt_backend(None, None), "faux");
+        assert_eq!(prompt_backend(Some(""), None), "faux");
+        assert_eq!(prompt_backend(None, Some("")), "faux");
+        assert_eq!(prompt_backend(Some(""), Some("")), "faux");
+        assert_eq!(prompt_backend(Some("socks5h://127.0.0.1:1080"), None), "faux");
+        assert_eq!(prompt_backend(None, Some("sk-test")), "faux");
+        assert_eq!(prompt_backend(Some(""), Some("sk-test")), "faux");
+        assert_eq!(prompt_backend(Some("socks5h://127.0.0.1:1080"), Some("")), "faux");
+        assert_eq!(
+            prompt_backend(Some("socks5h://127.0.0.1:1080"), Some("sk-test")),
+            "openrouter"
+        );
     }
 
     #[test]
