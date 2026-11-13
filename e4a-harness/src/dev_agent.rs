@@ -22,7 +22,7 @@ pub fn dev_agent() -> AgentRole {
     AgentRole {
         id: "dev",
         model: "cohere/north-mini-code:free",
-        tools: &["read", "write", "edit", "edit_all", "powershell", "jev"],
+        tools: &["read", "write", "edit", "edit_all", "powershell", "jev", "advise", "child"],
         instructions: "You are the developer. Change files only through tools. \
 Do not claim a file changed unless a tool result says so. \
 Thinking from the model is not stored as context.",
@@ -47,7 +47,7 @@ mod tests {
         assert_eq!(role.model, "cohere/north-mini-code:free");
         assert_eq!(
             role.tools,
-            &["read", "write", "edit", "edit_all", "powershell", "jev"][..]
+            &["read", "write", "edit", "edit_all", "powershell", "jev", "advise", "child"][..]
         );
         assert!(role.instructions.contains("You are the developer."));
         assert!(role

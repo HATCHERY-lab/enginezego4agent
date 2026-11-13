@@ -241,7 +241,22 @@ impl Generation {
                 let request = session
                     .commit(|tx| turn_request(tx, self, &checkpoint))
                     .await?;
-                let answer = match collect_answer(llm, &request).await {
+                let mut gate = crate::gate::Gate::open("turn").map_err(Error::message)?;
+                gate.park(self.task_id, "model").map_err(Error::message)?;
+                let collected = collect_answer(llm, &request).await;
+                let signaled = gate.signal("done");
+                let phase = gate.cancel(self.task_id);
+                let stored = gate.take_error(self.task_id);
+                if let Err(message) = signaled {
+                    return Err(Error::message(message));
+                }
+                if phase != "cancel" || stored.is_none() {
+                    return Err(Error::message(format!(
+                        "gate phase is {phase}, error missing: {}",
+                        stored.is_none()
+                    )));
+                }
+                let answer = match collected {
                     Ok(answer) => answer,
                     Err(err) => return Err(failed_model(err)),
                 };
@@ -260,9 +275,55 @@ impl Generation {
                     match compact_if_needed(llm, &lines, estimated_tokens, 200_000, &settings)
                         .await
                     {
-                        Ok(None) | Ok(Some(_)) => {}
+                        Ok(None) => {}
+                        Ok(Some(summary)) => {
+                            session
+                                .commit(|tx| {
+                                    tx.append_entry(
+                                        self.conversation_id,
+                                        EntryDraft {
+                                            kind: "pi.compaction".into(),
+                                            model: summary.get("model").cloned(),
+                                            data: None,
+                                            head: summary
+                                                .get("head")
+                                                .and_then(|value| value.as_i64()),
+                                            edits: None,
+                                        },
+                                    )?;
+                                    Ok(())
+                                })
+                                .await?;
+                        }
                         Err(message) => return Err(Error::message(message)),
                     }
+                }
+                let (name, finished, ended) = match &answer.tool {
+                    Some(call) => (call.name.clone(), false, None),
+                    None => ("answer".to_owned(), true, Some("end_turn")),
+                };
+                let slots = [(self.task_id, name, finished)];
+                session
+                    .commit_live(self.conversation_id, self.task_id, &slots, ended)
+                    .await?;
+                let _tail = crate::view_follow::follow_lines(session, self.conversation_id, 50)
+                    .await
+                    .map_err(Error::message)?;
+                let task = crate::scheduler_js::Task {
+                    id: self.task_id,
+                    kind: "generation".to_owned(),
+                    state: "idle".to_owned(),
+                    version: 1,
+                    abort_requested: false,
+                    abort_reason: String::new(),
+                    attempt: 0,
+                };
+                let mut pending = crate::notify_pass::PendingPass::default();
+                let ready = crate::scheduler_loop::drive_pass(&mut pending, &[task], |pending| {
+                    pending.notify_runnable(self.task_id)
+                });
+                if ready != Some(self.task_id) {
+                    return Err(Error::message("scheduler pass dropped the task"));
                 }
                 let failed_attempts = session
                     .task(self.task_id)
