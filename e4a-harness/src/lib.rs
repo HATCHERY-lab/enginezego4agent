@@ -5,6 +5,7 @@ mod context;
 mod define;
 mod generation;
 mod inbox;
+mod live_run;
 mod prompt;
 mod provider;
 mod scheduler;
@@ -12,12 +13,18 @@ mod submissions;
 mod tool_task;
 mod transcript;
 mod usage;
+mod view;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use context::{order_tool_results, Message};
 pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
 pub use inbox::{has_queued_reset, prepare_boundary, withdraw, InboxItem, QueueMode};
+pub use live_run::{
+    add_compaction_status, clear_progress, end_run, fail_compaction_status, finish_slot,
+    remove_compaction_status, remove_nested_slots, tool_slot, tool_slot_mut, CompactionStatus,
+    LiveRun, ToolSlot,
+};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
 pub use scheduler::{Scheduler, Waiter};
@@ -25,6 +32,7 @@ pub use submissions::{admit, withdraw_kind, Submission};
 pub use tool_task::ToolPhase;
 pub use transcript::{render, visible_lines, TranscriptLine};
 pub use usage::usage_doc;
+pub use view::window;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
