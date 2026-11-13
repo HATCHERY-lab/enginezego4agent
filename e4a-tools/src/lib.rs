@@ -133,6 +133,32 @@ async fn run_waiting_gated<L: Llm>(
             is_error: false,
             content: crate::jev_gate::render(&decision),
         }
+    } else if pending.name == "advise" {
+        let Some(llm) = llm else {
+            return Err(Error::message("advise needs a model"));
+        };
+        let question = pending
+            .arguments
+            .get("question")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        match e4a_harness::advise(llm, question).await {
+            Ok(text) => ToolEffect {
+                is_error: false,
+                content: text,
+            },
+            Err(text) => ToolEffect {
+                is_error: true,
+                content: text,
+            },
+        }
+    } else if pending.name == "child" {
+        child_effect(
+            generation_task_id,
+            pending.tool_task_id,
+            &pending.arguments,
+            workspace,
+        )
     } else {
         let decision = e4a_harness::decide(e4a_harness::JevSnap {
             tool: &pending.name,
@@ -164,6 +190,61 @@ async fn run_waiting_gated<L: Llm>(
         is_error: effect.is_error,
         content: effect.content,
     })
+}
+
+/// Record a child, then run its command in the workspace root.
+///
+/// An empty command does not spawn. `spawn_child` only records the child.
+/// [`e4a_env::LocalEnv::start_child`] is the process. A non-zero exit is an
+/// error result whose text is stderr. A zero exit is stdout.
+fn child_effect(
+    generation_task_id: i64,
+    tool_task_id: i64,
+    arguments: &Json,
+    workspace: &Workspace,
+) -> ToolEffect {
+    let command = arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if command.is_empty() {
+        return ToolEffect {
+            is_error: true,
+            content: "command is empty".to_owned(),
+        };
+    }
+    let child = match e4a_harness::spawn_child(generation_task_id, command, tool_task_id) {
+        Ok(child) => child,
+        Err(text) => {
+            return ToolEffect {
+                is_error: true,
+                content: text,
+            };
+        }
+    };
+    let env = match e4a_env::LocalEnv::new(workspace.root()) {
+        Ok(env) => env,
+        Err(error) => {
+            return ToolEffect {
+                is_error: true,
+                content: error.to_string(),
+            };
+        }
+    };
+    match env.start_child(&child.tool) {
+        Ok(output) if output.exit_code == 0 => ToolEffect {
+            is_error: false,
+            content: output.stdout,
+        },
+        Ok(output) => ToolEffect {
+            is_error: true,
+            content: output.stderr,
+        },
+        Err(error) => ToolEffect {
+            is_error: true,
+            content: error.to_string(),
+        },
+    }
 }
 
 async fn load_waiting(session: &Session, generation_task_id: i64) -> Result<PendingTool, Error> {
