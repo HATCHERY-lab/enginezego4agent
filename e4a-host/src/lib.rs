@@ -3,14 +3,15 @@
 //! Newline-delimited JSON-RPC on stdin and stdout.
 //!
 //! This process does not open a file store and it does not print a key.
-//! [`handle_line`] runs `session/prompt` as one in-memory turn. The turn is
-//! scripted unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty.
-//! That case dials OpenRouter. A dial failure is JSON-RPC `-32603`, and the
-//! key is not copied into the message.
+//! [`handle_line`] runs `session/prompt` through [`e4a_tools::run_until_answer`]
+//! on an in-memory session. The model is scripted unless both `E4A_SOCKS` and
+//! `E4A_OPENROUTER_KEY` are non-empty. That case dials OpenRouter. A dial or
+//! turn failure is JSON-RPC `-32603`, and the key is not copied into the message.
 
-use e4a_harness::{Generation, TurnInput, TurnKind};
-use e4a_llm::{FauxLlm, Llm, OpenRouterClient, Usage};
+use e4a_harness::{TurnInput, TurnKind};
+use e4a_llm::{FauxLlm, Llm, OpenRouterClient, ToolSchema, Usage};
 use e4a_session::{EntryRecord, Session, SessionEnd, ROOT_CONVERSATION_ID};
+use e4a_tools::{run_until_answer, Workspace};
 use serde_json::{json, Value};
 
 /// Subcommand of `e4a`. [`Command::Acp`] is the only subcommand besides help.
@@ -62,11 +63,13 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// A line that is not a JSON object with a string `method` returns [`Err`].
 /// Known methods return one JSON-RPC line ending in `\n`.
 ///
-/// `session/prompt` with one text block runs one in-memory generation and returns
-/// `{stopReason:"end_turn", text}`. [`prompt_backend`] is `faux` unless both
-/// `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty, in which case the turn
-/// dials OpenRouter. Missing prompt text is JSON-RPC `-32602`. A failure is
-/// JSON-RPC `-32603` and does not include the key.
+/// `session/prompt` with one text block runs the tool loop on an in-memory
+/// session and returns `{stopReason:"end_turn", text}` when the model answers.
+/// The workspace root is `cwd`, or `sessionId` when `cwd` is absent.
+/// [`prompt_backend`] is `faux` unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY`
+/// are non-empty, in which case the turn dials OpenRouter. Missing prompt text,
+/// or a missing workspace root, is JSON-RPC `-32602`. A failure is JSON-RPC
+/// `-32603` and does not include the key.
 pub fn handle_line(line: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
@@ -105,9 +108,25 @@ fn cwd_param(params: Option<&Value>) -> Option<&str> {
     if cwd.is_empty() { None } else { Some(cwd) }
 }
 
+/// `cwd` when it is a non-empty string. Otherwise `sessionId`, the id `session/new` returns.
+fn workspace_root(params: Option<&Value>) -> Option<&str> {
+    if let Some(cwd) = cwd_param(params) {
+        return Some(cwd);
+    }
+    let session_id = params?.get("sessionId")?.as_str()?;
+    if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id)
+    }
+}
+
 fn session_prompt(id: Value, params: Option<&Value>) -> Value {
     let Some(user_text) = prompt_text(params) else {
         return rpc_error(id, -32602, "prompt must be one non-empty text block");
+    };
+    let Some(root) = workspace_root(params) else {
+        return rpc_error(id, -32602, "cwd or sessionId must be a non-empty string");
     };
     let socks = std::env::var("E4A_SOCKS").ok();
     let key = std::env::var("E4A_OPENROUTER_KEY").ok();
@@ -125,11 +144,12 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
     let answered = if openrouter {
         runtime.block_on(openrouter_prompt(
             user_text,
+            root,
             socks.as_deref().unwrap_or(""),
             key.as_deref().unwrap_or(""),
         ))
     } else {
-        runtime.block_on(faux_prompt(user_text))
+        runtime.block_on(faux_prompt(user_text, root))
     };
     match answered {
         Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
@@ -167,23 +187,28 @@ fn prompt_text(params: Option<&Value>) -> Option<&str> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-async fn faux_prompt(user_text: &str) -> Result<String, String> {
+async fn faux_prompt(user_text: &str, root: &str) -> Result<String, String> {
     let llm = FauxLlm::text(user_text).with_usage(Usage {
         input_tokens: 1,
         output_tokens: 1,
         provider: "faux".into(),
         model: "scripted".into(),
     });
-    memory_prompt(user_text, &llm).await
+    memory_prompt(user_text, root, &llm).await
 }
 
-async fn openrouter_prompt(user_text: &str, socks: &str, key: &str) -> Result<String, String> {
+async fn openrouter_prompt(
+    user_text: &str,
+    root: &str,
+    socks: &str,
+    key: &str,
+) -> Result<String, String> {
     let from_env = std::env::var("E4A_MODEL").ok();
     let model = openrouter_model(from_env.as_deref());
     let llm = OpenRouterClient::new(model)
         .with_socks(socks)
         .with_key(key);
-    memory_prompt(user_text, &llm).await
+    memory_prompt(user_text, root, &llm).await
 }
 
 /// `E4A_MODEL` when it is set and non-empty. Otherwise `openrouter/auto`.
@@ -194,9 +219,9 @@ fn openrouter_model(from_env: Option<&str>) -> String {
     }
 }
 
-async fn memory_prompt(user_text: &str, llm: &impl Llm) -> Result<String, String> {
+async fn memory_prompt(user_text: &str, root: &str, llm: &impl Llm) -> Result<String, String> {
     let session = Session::memory().await.map_err(|err| err.to_string())?;
-    let answered = turn_text(&session, llm, user_text).await;
+    let answered = turn_text(&session, llm, user_text, root).await;
     let closed = session
         .close()
         .await
@@ -211,13 +236,19 @@ async fn memory_prompt(user_text: &str, llm: &impl Llm) -> Result<String, String
     }
 }
 
-async fn turn_text(session: &Session, llm: &impl Llm, user_text: &str) -> Result<String, String> {
+async fn turn_text(
+    session: &Session,
+    llm: &impl Llm,
+    user_text: &str,
+    root: &str,
+) -> Result<String, String> {
+    let workspace = Workspace::new(root).map_err(|err| err.to_string())?;
     let input = TurnInput {
         conversation_id: ROOT_CONVERSATION_ID,
         user_text: user_text.to_string(),
-        tools: Vec::new(),
+        tools: offered_tools(),
     };
-    let outcome = Generation::turn(session, llm, &input)
+    let outcome = run_until_answer(session, llm, &workspace, &input)
         .await
         .map_err(|err| err.to_string())?;
     let TurnKind::Answered { entry_id } = outcome.kind else {
@@ -239,6 +270,83 @@ fn redact_key(message: &str, key: &str) -> String {
         message.to_string()
     } else {
         message.replace(key, "[redacted]")
+    }
+}
+
+/// Same names and parameter objects as `e4a-tools` `examples/live.rs`.
+fn offered_tools() -> Vec<ToolSchema> {
+    vec![
+        schema(
+            "read",
+            "Read a UTF-8 file under the workspace root.",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
+        schema(
+            "write",
+            "Write a UTF-8 file under the workspace root.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "content":{"type":"string"}
+                },
+                "required":["path","content"]
+            }),
+        ),
+        schema(
+            "edit",
+            "Replace one exact occurrence in a file. Fails if the text occurs zero times or more than once.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "old":{"type":"string"},
+                    "new":{"type":"string"}
+                },
+                "required":["path","old","new"]
+            }),
+        ),
+        schema(
+            "edit_all",
+            "Replace every non-overlapping occurrence in a file.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "old":{"type":"string"},
+                    "new":{"type":"string"}
+                },
+                "required":["path","old","new"]
+            }),
+        ),
+        schema(
+            "jev",
+            "Ask the fast gate one question. It may read one file, then answers continue, stop, compact, or steer. It does not write or run commands.",
+            json!({
+                "type":"object",
+                "properties":{"question":{"type":"string"}},
+                "required":["question"]
+            }),
+        ),
+        schema(
+            "powershell",
+            "Run one PowerShell command in the workspace. Empty command is an error.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string"}
+                },
+                "required":["command"]
+            }),
+        ),
+    ]
+}
+
+fn schema(name: &str, description: &str, parameters: Value) -> ToolSchema {
+    ToolSchema {
+        name: name.into(),
+        description: description.into(),
+        parameters,
     }
 }
 
@@ -365,10 +473,17 @@ mod tests {
 
     #[test]
     fn prompt_returns_scripted_text() {
-        let line = handle_line(
-            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"/repo","prompt":[{"type":"text","text":"hi"}]}}"#,
-        )
-        .expect("prompt");
+        let root = std::env::temp_dir();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": root,
+                "prompt": [{"type": "text", "text": "hi"}]
+            }
+        });
+        let line = handle_line(&request.to_string()).expect("prompt");
         let value = parse_reply(&line);
         assert_eq!(value["id"], json!(3));
         assert_eq!(value["result"]["stopReason"], json!("end_turn"));

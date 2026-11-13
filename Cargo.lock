@@ -370,6 +370,7 @@ dependencies = [
  "e4a-harness",
  "e4a-llm",
  "e4a-session",
+ "e4a-tools",
  "serde_json",
  "tokio",
 ]
