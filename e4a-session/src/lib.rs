@@ -9,6 +9,7 @@ mod live;
 mod lookup;
 mod session;
 mod store;
+mod tails;
 mod tx;
 mod view;
 
@@ -20,6 +21,7 @@ pub use live::{
     cut_off_count, cut_off_too_often, salvageable, RunFailureReason, LIMIT_RESTARTS,
 };
 pub use lookup::task_conversation_id;
+pub use tails::{advance_tail, mint_key, parse_key, tail_entry_id};
 pub use session::{Session, SessionEnd};
 pub use tx::{
     ConversationOwnership, EntryDraft, SubmissionCreate, SubmissionSettlement, TaskCreate, Tx,
