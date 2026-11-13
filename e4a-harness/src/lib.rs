@@ -7,6 +7,7 @@ mod generation;
 mod inbox;
 mod prompt;
 mod provider;
+mod run_state;
 mod scheduler;
 mod submissions;
 mod tool_task;
@@ -20,6 +21,10 @@ pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CA
 pub use inbox::{has_queued_reset, prepare_boundary, withdraw, InboxItem, QueueMode};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
+pub use run_state::{
+    advance, blocked_reason, blocked_subject, ended_by_crashes, next_attempt, BlockedReason,
+    BlockedSubject, Invocation, RegisteredDefinition, RunEvent, RunPhase,
+};
 pub use scheduler::{Scheduler, Waiter};
 pub use submissions::{admit, withdraw_kind, Submission};
 pub use tool_task::ToolPhase;
