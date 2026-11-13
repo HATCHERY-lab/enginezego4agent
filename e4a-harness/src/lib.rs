@@ -8,6 +8,7 @@ mod generation;
 mod graph;
 mod inbox;
 mod json_merge;
+mod live_run;
 mod partial;
 mod prompt;
 mod provider;
@@ -22,6 +23,7 @@ mod tool_task;
 mod transcript;
 mod truncate;
 mod usage;
+mod view;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use context::{order_tool_results, Message};
@@ -31,6 +33,11 @@ pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CA
 pub use graph::{children, roots, would_cycle, TaskNode};
 pub use inbox::{has_queued_reset, prepare_boundary, withdraw, InboxItem, QueueMode};
 pub use json_merge::merge_object;
+pub use live_run::{
+    add_compaction_status, clear_progress, end_run, fail_compaction_status, finish_slot,
+    remove_compaction_status, remove_nested_slots, tool_slot, tool_slot_mut, CompactionStatus,
+    LiveRun, ToolSlot,
+};
 pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
@@ -45,6 +52,7 @@ pub use tool_task::ToolPhase;
 pub use transcript::{render, visible_lines, TranscriptLine};
 pub use truncate::truncate_chars;
 pub use usage::usage_doc;
+pub use view::window;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
