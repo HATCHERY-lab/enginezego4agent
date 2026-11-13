@@ -182,6 +182,11 @@ impl Storage for MemoryStorage {
         self.engine.borrow().scan_documents(query, limit, cursor)
     }
 
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.ensure()?;
+        self.engine.borrow_mut().delete_conversation(id)
+    }
+
     fn close(&self) -> Result<(), Error> {
         self.closed.set(true);
         Ok(())
