@@ -15,6 +15,8 @@ use e4a_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::generation_plan::{plan, stop_reason, PlanStep};
+use crate::tool_path::run_tool_round;
 use crate::usage::record_usage;
 use crate::Error;
 
@@ -236,7 +238,10 @@ impl Generation {
                 let request = session
                     .commit(|tx| turn_request(tx, self, &checkpoint))
                     .await?;
-                let answer = collect_answer(llm, &request).await?;
+                let answer = match collect_answer(llm, &request).await {
+                    Ok(answer) => answer,
+                    Err(err) => return Err(failed_model(err)),
+                };
                 let entry_id = session
                     .commit(|tx| commit_answer(tx, self, &checkpoint, &answer))
                     .await?;
@@ -773,6 +778,39 @@ fn coerced_arguments(task: &TaskRecord, call: &ToolCall) -> Json {
     coerce(&tool.parameters, &call.arguments)
 }
 
+fn offered_parameters(task: &TaskRecord, name: &str) -> Option<Json> {
+    let input = serde_json::from_value::<GenerationInput>(task.input.clone()).ok()?;
+    input
+        .tools
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .map(|tool| tool.parameters)
+}
+
+/// Coerced arguments after one tool round. The journal is not appended.
+fn round_arguments(task: &TaskRecord, call: &ToolCall) -> Result<Json, e4a_session::Error> {
+    let arguments = coerced_arguments(task, call);
+    let schema = offered_parameters(task, &call.name);
+    let journal = run_tool_round(&call.id, &call.name, arguments.clone(), schema.as_ref())
+        .map_err(e4a_session::Error::message)?;
+    if journal.get("toolCallId").and_then(Json::as_str) != Some(call.id.as_str())
+        || journal.get("name").and_then(Json::as_str) != Some(call.name.as_str())
+    {
+        return Err(e4a_session::Error::message(
+            "tool round does not match the stored call",
+        ));
+    }
+    Ok(journal.get("arguments").cloned().unwrap_or(arguments))
+}
+
+/// A failed model call keeps its message when the stop string is `error`.
+fn failed_model(err: Error) -> Error {
+    match stop_reason(false, true) {
+        "error" => err,
+        other => Error::message(format!("{other}: {err}")),
+    }
+}
+
 fn commit_answer(
     tx: &mut Tx,
     generation: &Generation,
@@ -781,12 +819,59 @@ fn commit_answer(
 ) -> Result<i64, e4a_session::Error> {
     let task = load_task(tx, generation.task_id)?;
     record_usage(tx, generation.conversation_id, &answer.usage)?;
+    let saw_tool = answer.tool.is_some();
+    let stored_arguments = match &answer.tool {
+        Some(call) => Some(round_arguments(&task, call)?),
+        None => None,
+    };
+    let mut entry_id = None;
+    let mut tool_started = false;
+    for step in plan(saw_tool) {
+        match step {
+            PlanStep::Prepare | PlanStep::Request => {}
+            PlanStep::AppendAssistant => {
+                entry_id = Some(append_assistant(
+                    tx,
+                    generation,
+                    answer,
+                    stored_arguments.as_ref(),
+                )?);
+            }
+            PlanStep::AppendTool => {
+                let id = entry_id.ok_or_else(|| {
+                    e4a_session::Error::message("tool round has no assistant entry")
+                })?;
+                let call = answer.tool.as_ref().ok_or_else(|| {
+                    e4a_session::Error::message("tool round has no tool call")
+                })?;
+                start_tool_task(tx, generation, &task, checkpoint, call, id)?;
+                tool_started = true;
+            }
+            PlanStep::Settle => {
+                if tool_started {
+                    continue;
+                }
+                let id = entry_id.ok_or_else(|| {
+                    e4a_session::Error::message("generation completed without an entry")
+                })?;
+                settle_from(tx, task.clone(), checkpoint, id)?;
+            }
+        }
+    }
+    entry_id.ok_or_else(|| e4a_session::Error::message("generation completed without an entry"))
+}
+
+fn append_assistant(
+    tx: &mut Tx,
+    generation: &Generation,
+    answer: &Answer,
+    arguments: Option<&Json>,
+) -> Result<i64, e4a_session::Error> {
     let mut content = Vec::new();
     if !answer.text.is_empty() {
         content.push(json!({ "type": "text", "text": answer.text }));
     }
-    if let Some(call) = &answer.tool {
-        let arguments = coerced_arguments(&task, call);
+    if let (Some(call), Some(arguments)) = (&answer.tool, arguments) {
         content.push(json!({
             "type": "toolCall",
             "id": call.id,
@@ -794,11 +879,7 @@ fn commit_answer(
             "arguments": arguments,
         }));
     }
-    let stop_reason = if answer.tool.is_some() {
-        "toolUse"
-    } else {
-        "stop"
-    };
+    let stop = stop_reason(answer.tool.is_some(), false);
     let entry = tx.append_entry(
         generation.conversation_id,
         EntryDraft {
@@ -813,53 +894,60 @@ fn commit_answer(
                     "output": answer.usage.output_tokens,
                     "cost": 0
                 },
-                "stopReason": stop_reason,
+                "stopReason": stop,
             }])),
             data: None,
             head: None,
             edits: None,
         },
     )?;
-    if let Some(call) = &answer.tool {
-        let tool = tx.create_task(TaskCreate {
-            kind: TOOL_KIND.into(),
-            version: 3,
-            conversation_id: generation.conversation_id,
-            input: json!({
-                "kind": "model",
-                "assistant": entry.id,
-                "callId": call.id,
-                "name": call.name,
-            }),
-            owner: Some(generation.task_id),
-            background: false,
-            checkpoint: json!({ "phase": "call" }),
-        })?;
-        let mut waiting = tool.clone();
-        waiting.state = TaskState::Waiting {
-            checkpoint: json!({ "phase": "call" }),
-            on: Vec::new(),
-            policy: JoinPolicy::AllSettled,
-        };
-        tx.set_task(waiting)?;
-        let mut parent = task;
-        let model_calls = checkpoint.model_calls.saturating_add(1);
-        parent.state = TaskState::Waiting {
-            checkpoint: json!({
-                "phase": "tools",
-                "assistant": entry.id,
-                "tools": [tool.id],
-                "pending": [],
-                "modelCalls": model_calls,
-            }),
-            on: vec![tool.id],
-            policy: JoinPolicy::AllSettled,
-        };
-        tx.set_task(parent)?;
-    } else {
-        settle_from(tx, task, checkpoint, entry.id)?;
-    }
     Ok(entry.id)
+}
+
+fn start_tool_task(
+    tx: &mut Tx,
+    generation: &Generation,
+    task: &TaskRecord,
+    checkpoint: &RequestCheckpoint,
+    call: &ToolCall,
+    entry_id: i64,
+) -> Result<(), e4a_session::Error> {
+    let tool = tx.create_task(TaskCreate {
+        kind: TOOL_KIND.into(),
+        version: 3,
+        conversation_id: generation.conversation_id,
+        input: json!({
+            "kind": "model",
+            "assistant": entry_id,
+            "callId": call.id,
+            "name": call.name,
+        }),
+        owner: Some(generation.task_id),
+        background: false,
+        checkpoint: json!({ "phase": "call" }),
+    })?;
+    let mut waiting = tool.clone();
+    waiting.state = TaskState::Waiting {
+        checkpoint: json!({ "phase": "call" }),
+        on: Vec::new(),
+        policy: JoinPolicy::AllSettled,
+    };
+    tx.set_task(waiting)?;
+    let mut parent = task.clone();
+    let model_calls = checkpoint.model_calls.saturating_add(1);
+    parent.state = TaskState::Waiting {
+        checkpoint: json!({
+            "phase": "tools",
+            "assistant": entry_id,
+            "tools": [tool.id],
+            "pending": [],
+            "modelCalls": model_calls,
+        }),
+        on: vec![tool.id],
+        policy: JoinPolicy::AllSettled,
+    };
+    tx.set_task(parent)?;
+    Ok(())
 }
 
 fn settle_answered(
