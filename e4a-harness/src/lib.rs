@@ -10,6 +10,7 @@ mod graph;
 mod inbox;
 mod json_merge;
 mod live_run;
+mod open_opts;
 mod partial;
 mod prompt;
 mod provider;
@@ -41,6 +42,10 @@ pub use live_run::{
     add_compaction_status, clear_progress, end_run, fail_compaction_status, finish_slot,
     remove_compaction_status, remove_nested_slots, tool_slot, tool_slot_mut, CompactionStatus,
     LiveRun, ToolSlot,
+};
+pub use open_opts::{
+    normalize_open, AgentSettings, Effort, ModelRef, OpenOptions, ThinkingLevel,
+    DEFAULT_RESTART_LIMIT,
 };
 pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
