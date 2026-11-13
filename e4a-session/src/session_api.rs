@@ -139,7 +139,7 @@ mod tests {
         );
         assert_eq!(
             usage_delta(i64::MIN, i64::MIN, -1, i64::MAX),
-            Err("input usage delta overflows".to_string())
+            Err("output usage delta overflows".to_string())
         );
     }
 
