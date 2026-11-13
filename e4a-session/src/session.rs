@@ -187,7 +187,9 @@ impl Session {
         let view = self.conversation_view(conversation_id, window)?;
         let mut views = lock_std(&self.inner.views)?;
         if let Some(sender) = views.get(&conversation_id) {
-            let _ = sender.send(view);
+            // `send` drops the value when nobody is listening. `send_replace`
+            // keeps it, so a later subscribe sees this view.
+            let _ = sender.send_replace(view);
             return Ok(sender.subscribe());
         }
         let (sender, receiver) = watch::channel(view);
@@ -452,7 +454,7 @@ fn refresh_views(inner: &Arc<Inner>) -> Result<(), Error> {
     for (conversation_id, sender) in views.iter() {
         if let Ok(view) = view_from_published(&published, *conversation_id, ConversationWindow::default())
         {
-            let _ = sender.send(view);
+            let _ = sender.send_replace(view);
         }
     }
     Ok(())
