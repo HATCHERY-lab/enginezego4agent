@@ -2,8 +2,10 @@
 
 mod compaction;
 mod compaction_job;
+mod compaction_run;
 mod context;
 mod context_bounds;
+mod context_load;
 mod define;
 mod errors;
 mod generation;
@@ -36,8 +38,10 @@ mod view;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
+pub use compaction_run::compact_with;
 pub use context::{order_tool_results, Message};
 pub use context_bounds::{clamp_bounds, token_estimate, within, Bounds};
+pub use context_load::{load_lines, Line};
 pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use errors::error_chain;
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
