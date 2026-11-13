@@ -3,11 +3,13 @@
 //! Synchronous `Storage`. Semantic refusals come back on [`CommitResult`]; every other failure is [`Error`].
 
 mod engine;
+mod indexeddb;
 mod memory;
 mod scan_page;
 mod sqlite;
 
 pub use e4a_types::*;
+pub use indexeddb::{open, schema, MemoryIdb, ObjectIndex, ObjectStore, Schema};
 pub use memory::MemoryStorage;
 pub use scan_page::page;
 pub use sqlite::SqliteStorage;
