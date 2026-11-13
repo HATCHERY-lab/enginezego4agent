@@ -13,6 +13,7 @@ mod partial;
 mod prompt;
 mod provider;
 mod registry;
+mod run_state;
 mod scheduler;
 mod search;
 mod submissions;
@@ -42,6 +43,10 @@ pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
 pub use registry::Registry;
+pub use run_state::{
+    advance, blocked_reason, blocked_subject, ended_by_crashes, next_attempt, BlockedReason,
+    BlockedSubject, Invocation, RegisteredDefinition, RunEvent, RunPhase,
+};
 pub use scheduler::{Scheduler, Waiter};
 pub use search::find_line;
 pub use submissions::{admit, withdraw_kind, Submission};
