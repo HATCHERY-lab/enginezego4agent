@@ -3,7 +3,7 @@
 mod generation;
 mod usage;
 
-pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, RESTART_CAP};
+pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
 pub use usage::usage_doc;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

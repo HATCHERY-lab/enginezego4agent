@@ -22,12 +22,23 @@ impl Error {
 }
 
 /// One chat message offered to a model.
+///
+/// Tool results set [`Self::tool_call_id`] and [`Self::is_error`]. Both default
+/// empty so a message written before those fields still parses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// JSON schema of one tool the model may call. This slice does not run it.

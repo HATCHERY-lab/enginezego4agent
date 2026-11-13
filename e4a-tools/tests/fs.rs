@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use e4a_harness::{Generation, TurnInput, TurnKind};
+use e4a_harness::{Generation, TurnInput, TurnKind, MODEL_CALL_CAP};
 use e4a_llm::{FauxLlm, ToolCall, ToolSchema};
 use e4a_session::{Session, TaskState, ROOT_CONVERSATION_ID};
 use e4a_tools::{run_waiting_tool, Workspace};
@@ -373,5 +373,197 @@ async fn unknown_tool_commits_an_error_result() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("not waiting"));
+    session.close().await.unwrap();
+}
+
+fn offered(name: &str) -> TurnInput {
+    TurnInput {
+        conversation_id: ROOT_CONVERSATION_ID,
+        user_text: format!("use {name}"),
+        tools: vec![ToolSchema {
+            name: name.into(),
+            description: "filesystem".into(),
+            parameters: json!({ "type": "object" }),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn continue_after_write_answers_with_the_file() {
+    let (scratch, ws) = workspace();
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("")
+        .with_tool_call(ToolCall {
+            id: "call-1".into(),
+            name: "write".into(),
+            arguments: json!({ "path": "note.txt", "content": "hello" }),
+        })
+        .then(FauxLlm::text("wrote it"));
+    let outcome = Generation::turn(&session, &llm, &offered("write"))
+        .await
+        .unwrap();
+    assert!(matches!(outcome.kind, TurnKind::WaitingTool { .. }));
+    let generation = Generation::bind(outcome.task_id, ROOT_CONVERSATION_ID);
+    let early = generation
+        .continue_after_tool(&session, &llm)
+        .await
+        .unwrap_err();
+    assert!(early.to_string().contains("still waiting"), "{early}");
+    assert_eq!(llm.calls(), 1);
+    assert!(!scratch.path().join("note.txt").exists());
+    assert_eq!(
+        session.task(outcome.task_id).await.unwrap().unwrap().state.status(),
+        TaskStatus::Waiting
+    );
+
+    let wrote = run_waiting_tool(&session, outcome.task_id, &ws)
+        .await
+        .unwrap();
+    assert!(!wrote.is_error, "{}", wrote.content);
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("note.txt")).unwrap(),
+        "hello"
+    );
+
+    let done = generation
+        .continue_after_tool(&session, &llm)
+        .await
+        .unwrap();
+    let TurnKind::Answered { entry_id } = done.kind else {
+        panic!("expected an answer, got {:?}", done.kind);
+    };
+    assert!(done.called_llm);
+    assert_eq!(done.failed_attempts, 0);
+    assert_eq!(llm.calls(), 2);
+    let stored = session.entry(entry_id).await.unwrap().unwrap();
+    assert_eq!(stored.kind, "pi.assistant");
+    assert_eq!(
+        stored.model.unwrap()[0]["content"][0]["text"],
+        json!("wrote it")
+    );
+    let seen = llm.requests();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].messages.len(), 3);
+    assert_eq!(seen[1].messages[1].tool_calls.len(), 1);
+    assert_eq!(seen[1].messages[1].tool_calls[0].id, "call-1");
+    assert_eq!(seen[1].messages[1].tool_calls[0].name, "write");
+    assert_eq!(seen[1].messages[2].role, "tool");
+    assert_eq!(seen[1].messages[2].tool_call_id.as_deref(), Some("call-1"));
+    assert!(!seen[1].messages[2].is_error);
+    assert!(seen[1].messages[2].tool_calls.is_empty());
+    assert_eq!(seen[1].messages[2].text, "wrote note.txt");
+    assert_eq!(
+        session.task(outcome.task_id).await.unwrap().unwrap().state.status(),
+        TaskStatus::Terminal
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn continue_after_tool_error_reaches_the_model() {
+    let (scratch, ws) = workspace();
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("")
+        .with_tool_call(ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": "missing.txt" }),
+        })
+        .then(FauxLlm::text("saw the error"));
+    let outcome = Generation::turn(&session, &llm, &offered("read"))
+        .await
+        .unwrap();
+    let generation = Generation::bind(outcome.task_id, ROOT_CONVERSATION_ID);
+    let failed = run_waiting_tool(&session, outcome.task_id, &ws)
+        .await
+        .unwrap();
+    assert!(failed.is_error, "{}", failed.content);
+    assert!(!scratch.path().join("missing.txt").exists());
+    let entry = session.entry(failed.entry_id).await.unwrap().unwrap();
+    assert_eq!(entry.model.unwrap()[0]["isError"], json!(true));
+
+    let done = generation
+        .continue_after_tool(&session, &llm)
+        .await
+        .unwrap();
+    let TurnKind::Answered { entry_id } = done.kind else {
+        panic!("expected an answer, got {:?}", done.kind);
+    };
+    assert!(done.called_llm);
+    assert_eq!(llm.calls(), 2);
+    let stored = session.entry(entry_id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.model.unwrap()[0]["content"][0]["text"],
+        json!("saw the error")
+    );
+    let seen = llm.requests();
+    assert_eq!(seen.len(), 2);
+    let tool = &seen[1].messages[2];
+    assert_eq!(tool.role, "tool");
+    assert_eq!(tool.tool_call_id.as_deref(), Some("call-1"));
+    assert!(tool.is_error);
+    assert!(tool.tool_calls.is_empty());
+    assert_eq!(tool.text, failed.content);
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_loop_stops_after_four_model_calls() {
+    let (scratch, ws) = workspace();
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("").with_tool_call(ToolCall {
+        id: "call-1".into(),
+        name: "write".into(),
+        arguments: json!({ "path": "loop.txt", "content": "x" }),
+    });
+    let mut outcome = Generation::turn(&session, &llm, &offered("write"))
+        .await
+        .unwrap();
+    let generation = Generation::bind(outcome.task_id, ROOT_CONVERSATION_ID);
+    for call in 1..=MODEL_CALL_CAP {
+        let TurnKind::WaitingTool { tool_task_id, .. } = outcome.kind else {
+            panic!("model call {call} should wait on a tool");
+        };
+        assert_eq!(
+            session.task(tool_task_id).await.unwrap().unwrap().state.status(),
+            TaskStatus::Waiting
+        );
+        let ran = run_waiting_tool(&session, generation.task_id(), &ws)
+            .await
+            .unwrap();
+        assert!(!ran.is_error, "{}", ran.content);
+        if call == MODEL_CALL_CAP {
+            break;
+        }
+        outcome = generation
+            .continue_after_tool(&session, &llm)
+            .await
+            .unwrap();
+        assert!(outcome.called_llm);
+    }
+    assert_eq!(llm.calls(), MODEL_CALL_CAP as u64);
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("loop.txt")).unwrap(),
+        "x"
+    );
+    let capped = generation
+        .continue_after_tool(&session, &llm)
+        .await
+        .unwrap();
+    assert_eq!(capped.kind, TurnKind::RestartLimit);
+    assert!(!capped.called_llm);
+    assert_eq!(capped.failed_attempts, 0);
+    assert_eq!(llm.calls(), MODEL_CALL_CAP as u64);
+    let again = generation
+        .continue_after_tool(&session, &llm)
+        .await
+        .unwrap();
+    assert_eq!(again.kind, TurnKind::RestartLimit);
+    assert!(!again.called_llm);
+    assert_eq!(llm.calls(), MODEL_CALL_CAP as u64);
+    assert_eq!(
+        session.task(generation.task_id()).await.unwrap().unwrap().state.status(),
+        TaskStatus::Terminal
+    );
     session.close().await.unwrap();
 }

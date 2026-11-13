@@ -2,6 +2,7 @@
 
 //! One generation: commit the request, call the model outside the writer, commit the answer.
 //! A `request` checkpoint with no assistant entry is a failed attempt. Five of those end the task.
+//! A finished tool resumes the same generation. Four committed model calls end it.
 
 use e4a_llm::{ChatMessage, EventStream, Llm, LlmEvent, ToolCall, ToolSchema, TurnRequest, Usage};
 use e4a_session::{
@@ -18,8 +19,12 @@ use crate::Error;
 /// Same cap as pi-durable `DEFAULT_RESTART_LIMIT`. The next resume after it does not call the model.
 pub const RESTART_CAP: i64 = 5;
 
+/// Model calls one generation may commit. The next call returns [`TurnKind::RestartLimit`].
+pub const MODEL_CALL_CAP: i64 = 4;
+
 const GENERATION_KIND: &str = "pi.generation";
 const TOOL_KIND: &str = "pi.tool";
+const TOOL_RESULT_KIND: &str = "pi.toolResult";
 const USER_KIND: &str = "pi.user";
 const ASSISTANT_KIND: &str = "pi.assistant";
 
@@ -80,6 +85,9 @@ struct RequestCheckpoint {
     cutoff: i64,
     failed_attempts: i64,
     submission_id: i64,
+    /// Model calls already committed for this generation.
+    #[serde(default)]
+    model_calls: i64,
 }
 
 struct Answer {
@@ -101,6 +109,14 @@ impl Generation {
 
     pub fn conversation_id(&self) -> i64 {
         self.conversation_id
+    }
+
+    /// An existing generation task. The store is not read.
+    pub fn bind(task_id: i64, conversation_id: i64) -> Self {
+        Self {
+            task_id,
+            conversation_id,
+        }
     }
 
     /// Place the user submission and leave the generation running in `request`.
@@ -153,6 +169,9 @@ impl Generation {
                         .finish_answered(session, &checkpoint, entry_id, false)
                         .await;
                 }
+                if let Some(outcome) = self.at_model_cap(session, &checkpoint).await? {
+                    return Ok(outcome);
+                }
                 let next = checkpoint.failed_attempts.saturating_add(1);
                 if next > RESTART_CAP {
                     return Ok(self.limit_outcome(checkpoint.failed_attempts));
@@ -168,11 +187,50 @@ impl Generation {
         }
     }
 
+    /// Resume after the caller has already run the waiting tool.
+    ///
+    /// A tool task that is still waiting is an error. This does not run it.
+    /// The parent leaves `Waiting` for `request` at the tool-result entry, without
+    /// a model call. The model then runs outside the writer.
+    /// Text ends the generation. Another tool call waits again and is not run here.
+    pub async fn continue_after_tool<L: Llm>(
+        &self,
+        session: &Session,
+        llm: &L,
+    ) -> Result<TurnOutcome, Error> {
+        let live = session.commit(|tx| inspect(tx, self)).await?;
+        match live {
+            Live::Terminal(outcome) => Ok(outcome),
+            Live::Request(_) => Err(Error::message("generation is not waiting on a tool")),
+            Live::Waiting(_) => {
+                session.commit(|tx| release_after_tool(tx, self)).await?;
+                self.execute(session, llm).await
+            }
+        }
+    }
+
+    async fn at_model_cap(
+        &self,
+        session: &Session,
+        checkpoint: &RequestCheckpoint,
+    ) -> Result<Option<TurnOutcome>, Error> {
+        if checkpoint.model_calls < MODEL_CALL_CAP {
+            return Ok(None);
+        }
+        session
+            .commit(|tx| stop_for_model_cap(tx, self.task_id))
+            .await?;
+        Ok(Some(self.limit_outcome(checkpoint.failed_attempts)))
+    }
+
     async fn execute<L: Llm>(&self, session: &Session, llm: &L) -> Result<TurnOutcome, Error> {
         let live = session.commit(|tx| inspect(tx, self)).await?;
         match live {
             Live::Terminal(outcome) | Live::Waiting(outcome) => Ok(outcome),
             Live::Request(checkpoint) => {
+                if let Some(outcome) = self.at_model_cap(session, &checkpoint).await? {
+                    return Ok(outcome);
+                }
                 let request = session
                     .commit(|tx| turn_request(tx, self, &checkpoint))
                     .await?;
@@ -276,6 +334,7 @@ fn commit_intent(tx: &mut Tx, input: &TurnInput) -> Result<i64, e4a_session::Err
             cutoff: entry.id,
             failed_attempts: 0,
             submission_id: submission.id,
+            model_calls: 0,
         })?,
     };
     tx.set_task(running)?;
@@ -366,12 +425,7 @@ fn waiting_outcome(
         .get("assistant")
         .and_then(Json::as_i64)
         .ok_or_else(|| e4a_session::Error::message("tool round has no assistant entry"))?;
-    let tool_task_id = checkpoint
-        .get("tools")
-        .and_then(Json::as_array)
-        .and_then(|tools| tools.first())
-        .and_then(Json::as_i64)
-        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))?;
+    let tool_task_id = first_tool_id(checkpoint)?;
     Ok(TurnOutcome {
         task_id,
         failed_attempts: task.restarts.unwrap_or(0),
@@ -488,12 +542,27 @@ fn conversation_entries(
 }
 
 fn message_from_entry(entry: &EntryRecord) -> Option<ChatMessage> {
-    let model = entry.model.as_ref()?.as_array()?.first()?.clone();
-    let role = model
-        .get("role")
-        .and_then(Json::as_str)
-        .unwrap_or("user")
-        .to_string();
+    let model = entry.model.as_ref()?.as_array()?.first()?;
+    let role = model.get("role").and_then(Json::as_str).unwrap_or("user");
+    if entry.kind == TOOL_RESULT_KIND || role == "tool" {
+        let text = model
+            .get("content")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        let tool_call_id = model
+            .get("toolCallId")
+            .and_then(Json::as_str)
+            .map(str::to_string);
+        let is_error = model.get("isError").and_then(Json::as_bool).unwrap_or(false);
+        return Some(ChatMessage {
+            role: "tool".into(),
+            text,
+            tool_calls: Vec::new(),
+            tool_call_id,
+            is_error,
+        });
+    }
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     match model.get("content") {
@@ -524,10 +593,136 @@ fn message_from_entry(entry: &EntryRecord) -> Option<ChatMessage> {
         _ => {}
     }
     Some(ChatMessage {
-        role,
+        role: role.to_string(),
         text,
         tool_calls,
+        tool_call_id: None,
+        is_error: false,
     })
+}
+
+fn release_after_tool(tx: &mut Tx, generation: &Generation) -> Result<(), e4a_session::Error> {
+    let mut task = load_task(tx, generation.task_id)?;
+    if task.conversation_id != generation.conversation_id {
+        return Err(e4a_session::Error::message(
+            "generation is in another conversation",
+        ));
+    }
+    let checkpoint = match &task.state {
+        TaskState::Waiting { checkpoint, .. } => checkpoint.clone(),
+        _ => {
+            return Err(e4a_session::Error::message(
+                "generation is not waiting on a tool",
+            ));
+        }
+    };
+    if checkpoint.get("phase").and_then(Json::as_str) != Some("tools") {
+        return Err(e4a_session::Error::message(
+            "generation is not waiting on a tool",
+        ));
+    }
+    let model_calls = checkpoint_model_calls(&checkpoint);
+    let tool_task_id = first_tool_id(&checkpoint)?;
+    let tool = load_task(tx, tool_task_id)?;
+    if tool.kind != TOOL_KIND {
+        return Err(e4a_session::Error::message(format!(
+            "task {} is not a tool",
+            tool.id
+        )));
+    }
+    if tool.owner != Some(generation.task_id) {
+        return Err(e4a_session::Error::message(
+            "tool task is not owned by this generation",
+        ));
+    }
+    let entry_id = tool_result_entry(tx, &tool)?;
+    let stored: GenerationInput = serde_json::from_value(task.input.clone())
+        .map_err(|err| e4a_session::Error::message(err.to_string()))?;
+    let request = RequestCheckpoint {
+        phase: "request".into(),
+        attempt: 1,
+        cutoff: entry_id,
+        failed_attempts: task.restarts.unwrap_or(0),
+        submission_id: stored.submission_id,
+        model_calls,
+    };
+    task.state = TaskState::Running {
+        checkpoint: serde_json::to_value(&request)?,
+    };
+    tx.set_task(task)?;
+    Ok(())
+}
+
+fn stop_for_model_cap(tx: &mut Tx, task_id: i64) -> Result<(), e4a_session::Error> {
+    let mut task = load_task(tx, task_id)?;
+    if matches!(task.state, TaskState::Terminal { .. }) {
+        return Ok(());
+    }
+    task.state = TaskState::Terminal {
+        outcome: TaskOutcome::Failed {
+            error: TaskOutcomeError {
+                message: format!("The generation made {MODEL_CALL_CAP} model calls"),
+                detail: Some(json!({ "reason": "restart_limit" })),
+            },
+            result: None,
+        },
+    };
+    tx.set_task(task)?;
+    Ok(())
+}
+
+fn first_tool_id(checkpoint: &Json) -> Result<i64, e4a_session::Error> {
+    checkpoint
+        .get("tools")
+        .and_then(Json::as_array)
+        .and_then(|tools| tools.first())
+        .and_then(Json::as_i64)
+        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))
+}
+
+fn checkpoint_model_calls(checkpoint: &Json) -> i64 {
+    checkpoint
+        .get("modelCalls")
+        .and_then(Json::as_i64)
+        .unwrap_or(0)
+}
+
+fn tool_result_entry(tx: &mut Tx, tool: &TaskRecord) -> Result<i64, e4a_session::Error> {
+    if matches!(tool.state, TaskState::Waiting { .. }) {
+        return Err(e4a_session::Error::message(
+            "tool task is still waiting",
+        ));
+    }
+    let TaskState::Terminal { outcome } = &tool.state else {
+        return Err(e4a_session::Error::message(format!(
+            "tool task {} is not terminal",
+            tool.id
+        )));
+    };
+    let result = match outcome {
+        TaskOutcome::Completed { result } => result,
+        TaskOutcome::Failed {
+            result: Some(result),
+            ..
+        } => result,
+        _ => {
+            return Err(e4a_session::Error::message(
+                "tool task ended without a result entry",
+            ));
+        }
+    };
+    let entry_id = result.get("entryId").and_then(Json::as_i64).ok_or_else(|| {
+        e4a_session::Error::message("tool task result has no entry")
+    })?;
+    let entry = tx.entry(entry_id)?.ok_or_else(|| {
+        e4a_session::Error::message(format!("entry {entry_id} does not exist"))
+    })?;
+    if entry.kind != TOOL_RESULT_KIND || entry.conversation_id != tool.conversation_id {
+        return Err(e4a_session::Error::message(format!(
+            "entry {entry_id} is not a tool result"
+        )));
+    }
+    Ok(entry_id)
 }
 
 async fn collect_answer<L: Llm>(llm: &L, request: &TurnRequest) -> Result<Answer, Error> {
@@ -634,12 +829,14 @@ fn commit_answer(
         };
         tx.set_task(waiting)?;
         let mut parent = task;
+        let model_calls = checkpoint.model_calls.saturating_add(1);
         parent.state = TaskState::Waiting {
             checkpoint: json!({
                 "phase": "tools",
                 "assistant": entry.id,
                 "tools": [tool.id],
                 "pending": [],
+                "modelCalls": model_calls,
             }),
             on: vec![tool.id],
             policy: JoinPolicy::AllSettled,

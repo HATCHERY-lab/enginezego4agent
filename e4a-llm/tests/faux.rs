@@ -9,6 +9,8 @@ fn request() -> TurnRequest {
             role: "user".into(),
             text: "hi".into(),
             tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
         }],
         tools: vec![ToolSchema {
             name: "read".into(),
@@ -56,6 +58,36 @@ async fn faux_replays_text_tool_call_and_usage() {
         ]
     );
     assert_eq!(llm.calls(), 1);
+}
+
+#[tokio::test]
+async fn faux_replays_scripts_in_order_then_repeats_the_last() {
+    let single = FauxLlm::text("only");
+    let first = collect(&single, &request()).await.unwrap();
+    let second = collect(&single, &request()).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(single.calls(), 2);
+
+    let llm = FauxLlm::text("one").then(FauxLlm::text("two"));
+    let one = collect(&llm, &request()).await.unwrap();
+    let two = collect(&llm, &request()).await.unwrap();
+    let again = collect(&llm, &request()).await.unwrap();
+    assert_eq!(one[0], LlmEvent::Text("one".into()));
+    assert_eq!(two[0], LlmEvent::Text("two".into()));
+    assert_eq!(again[0], LlmEvent::Text("two".into()));
+    assert_eq!(llm.calls(), 3);
+    assert_eq!(llm.requests().len(), 3);
+}
+
+#[test]
+fn chat_message_without_tool_fields_parses() {
+    let message: ChatMessage =
+        serde_json::from_str(r#"{"role":"user","text":"hi"}"#).unwrap();
+    assert_eq!(message.role, "user");
+    assert_eq!(message.text, "hi");
+    assert!(message.tool_calls.is_empty());
+    assert_eq!(message.tool_call_id, None);
+    assert!(!message.is_error);
 }
 
 #[tokio::test]
