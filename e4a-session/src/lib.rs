@@ -9,6 +9,7 @@ mod keys;
 mod live;
 mod lookup;
 mod session;
+mod session_api;
 mod store;
 mod tails;
 mod tx;
@@ -26,6 +27,7 @@ pub use live::{
 pub use lookup::task_conversation_id;
 pub use tails::{advance_tail, mint_key, parse_key, tail_entry_id};
 pub use session::{Session, SessionEnd};
+pub use session_api::{fork_parent, role_of, usage_delta, visible_entry};
 pub use tx::{
     ConversationOwnership, EntryDraft, SubmissionCreate, SubmissionSettlement, TaskCreate, Tx,
 };
