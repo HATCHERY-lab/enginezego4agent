@@ -1,12 +1,13 @@
 //! Optional QuickJS evaluation. No animation host and no network.
 
 #[cfg(feature = "quickjs")]
-use rquickjs::{Context, Ctx, Error, Runtime};
+use rquickjs::{Coerced, Context, Ctx, Error, FromJs, Runtime, Value};
 
-/// Evaluate `code` and return its string value.
+/// Evaluate `code` and return its text.
 ///
 /// Without the `quickjs` feature the engine is not linked.
 /// With the feature, an empty `code` is `empty` and a thrown exception is its text.
+/// A string result is that string. Any other value is its JavaScript string form.
 pub fn eval_source(code: &str) -> Result<String, String> {
     #[cfg(not(feature = "quickjs"))]
     {
@@ -28,10 +29,19 @@ fn eval_linked(code: &str) -> Result<String, String> {
     // Declared after the runtime so it drops first and detaches before the runtime.
     let _jit = attach_jit(&runtime);
     let ctx = Context::full(&runtime).map_err(|e| e.to_string())?;
-    ctx.with(|c| match c.eval::<String, _>(code) {
-        Ok(value) => Ok(value),
+    ctx.with(|c| match c.eval::<Value, _>(code) {
+        Ok(value) => value_text(&c, value),
         Err(error) => Err(exception_text(&c, error)),
     })
+}
+
+/// JavaScript `ToString`. A string stays its contents; other values use the engine's string form.
+#[cfg(feature = "quickjs")]
+fn value_text<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String, String> {
+    match Coerced::<String>::from_js(ctx, value) {
+        Ok(text) => Ok(text.0),
+        Err(error) => Err(exception_text(ctx, error)),
+    }
 }
 
 /// Native codegen when this target has it. A failed attach leaves the interpreter.
@@ -56,4 +66,16 @@ fn exception_text(ctx: &Ctx<'_>, error: Error) -> String {
             .unwrap_or_else(|| format!("{ex:?}"));
     }
     error.to_string()
+}
+
+#[cfg(all(test, feature = "quickjs"))]
+mod tests {
+    use super::eval_source;
+
+    #[test]
+    fn script_result_is_text() {
+        assert_eq!(eval_source("1+1"), Ok("2".to_owned()));
+        assert_eq!(eval_source("\"hi\""), Ok("hi".to_owned()));
+        assert_eq!(eval_source(""), Err("empty".to_owned()));
+    }
 }
