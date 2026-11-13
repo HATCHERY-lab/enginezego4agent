@@ -271,6 +271,10 @@ impl Storage for Checking<'_> {
         self.inner.scan_documents(query, limit, cursor)
     }
 
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.inner.delete_conversation(id)
+    }
+
     fn close(&self) -> Result<(), Error> {
         self.inner.close()
     }
@@ -508,6 +512,10 @@ impl Storage for Reopening {
         cursor: Option<&Cursor>,
     ) -> Result<Page<e4a_store::DocumentRecord>, Error> {
         self.with_live(|storage| storage.scan_documents(query, limit, cursor))
+    }
+
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.with_live(|storage| storage.delete_conversation(id))
     }
 
     fn close(&self) -> Result<(), Error> {

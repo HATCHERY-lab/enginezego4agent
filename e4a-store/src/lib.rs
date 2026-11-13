@@ -106,5 +106,12 @@ pub trait Storage {
         cursor: Option<&Cursor>,
     ) -> Result<Page<DocumentRecord>, Error>;
 
+    /// Permanently delete a conversation and its entries, tasks, submissions, and documents.
+    ///
+    /// [`ROOT_CONVERSATION_ID`] is refused: the root cannot be deleted. Children that
+    /// point at `id` as parent stay; this does not recurse. A later [`Storage::conversation`]
+    /// is `Ok(None)`.
+    fn delete_conversation(&self, id: i64) -> Result<(), Error>;
+
     fn close(&self) -> Result<(), Error>;
 }

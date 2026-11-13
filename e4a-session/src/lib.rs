@@ -5,6 +5,7 @@
 mod docs;
 mod forks;
 mod keys;
+mod lookup;
 mod session;
 mod store;
 mod tx;
@@ -14,6 +15,7 @@ pub use docs::{
     agent_doc, compaction_fields, provider_doc, address_id, Checkpoint, CompactionSettings, DocDef,
     DocRef, DocScopeKind, AGENT_KIND, PROVIDER_KIND,
 };
+pub use lookup::task_conversation_id;
 pub use session::{Session, SessionEnd};
 pub use tx::{
     ConversationOwnership, EntryDraft, SubmissionCreate, SubmissionSettlement, TaskCreate, Tx,

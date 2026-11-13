@@ -1,6 +1,6 @@
 // Portions derived from pi-durable 1.5.2 (packages/durable/src/session/session.ts), MIT, © 2025 Mario Zechner / Earendil Works. See LICENSES/pi-MIT.txt.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use e4a_store::{MemoryStorage, SqliteStorage, Storage};
 use e4a_types::{
     ConversationRecord, DocumentAddress, DocumentQuery, DocumentScope, EntryQuery, EntryRecord,
-    Json, ScanOrder, ROOT_CONVERSATION_ID,
+    Json, ScanOrder, TaskQuery, ROOT_CONVERSATION_ID,
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
@@ -205,6 +205,44 @@ impl Session {
             .call(move |storage| storage.submission(id).map_err(Error::from))
     }
 
+    /// Permanently delete a conversation on the store writer thread.
+    ///
+    /// Root conversation 1 is refused. Children that point at `id` as parent stay;
+    /// this does not recurse.
+    pub async fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        let _line = self.inner.line.lock().await;
+        self.assert_usable()?;
+        self.inner.store.drained()?;
+        let query = TaskQuery {
+            conversation_id: Some(id),
+            ..TaskQuery::default()
+        };
+        let task_ids: HashSet<i64> = self.inner.store.call(move |storage| {
+            let page = storage
+                .scan_tasks(&query, usize::MAX, None)
+                .map_err(Error::from)?;
+            Ok(page.items.into_iter().map(|task| task.id).collect())
+        })?;
+        self.inner
+            .store
+            .call(move |storage| storage.delete_conversation(id).map_err(Error::from))?;
+        {
+            let mut published = lock_std(&self.inner.published)?;
+            published.conversations.remove(&id);
+            published.entries.remove(&id);
+            published.documents.retain(|_, document| match document.record.scope {
+                DocumentScope::Conversation { conversation_id } => conversation_id != id,
+                DocumentScope::Task { task_id } => !task_ids.contains(&task_id),
+                DocumentScope::Session => true,
+            });
+        }
+        {
+            let mut views = lock_std(&self.inner.views)?;
+            views.remove(&id);
+        }
+        refresh_views(&self.inner)
+    }
+
     pub async fn close(&self) -> Result<SessionEnd, Error> {
         {
             let _line = self.inner.line.lock().await;
@@ -260,15 +298,25 @@ impl Session {
     }
 
     fn load_conversation(&self, conversation_id: i64) -> Result<(), Error> {
+        if !self.publish_conversation(conversation_id)? {
+            return Err(Error::message(format!(
+                "Conversation {conversation_id} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    fn publish_conversation(&self, conversation_id: i64) -> Result<bool, Error> {
         let conversation = self
             .inner
             .store
-            .call(move |storage| storage.conversation(conversation_id).map_err(Error::from))?
-            .ok_or_else(|| {
-                Error::message(format!("Conversation {conversation_id} does not exist"))
-            })?;
+            .call(move |storage| storage.conversation(conversation_id).map_err(Error::from))?;
+        let Some(conversation) = conversation else {
+            return Ok(false);
+        };
         if let Some(parent) = conversation.parent {
-            self.load_conversation(parent.conversation_id)?;
+            // Children that point at a deleted parent stay; do not require that row.
+            self.publish_conversation(parent.conversation_id)?;
         }
         let query = EntryQuery {
             conversation_id,
@@ -299,7 +347,7 @@ impl Session {
                 .documents
                 .insert(document.address_id.clone(), document);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn conversation_view(
@@ -417,17 +465,22 @@ fn collect_visible_entries(
         .get(&conversation_id)
         .ok_or_else(|| Error::message(format!("Conversation {conversation_id} does not exist")))?;
     if let Some(parent) = conversation.parent {
-        let parent_until = match until {
-            Some(at) if at < parent.at => at,
-            _ => parent.at,
-        };
-        collect_visible_entries(
-            published,
-            parent.conversation_id,
-            Some(parent_until),
-            out,
-            seen,
-        )?;
+        if published
+            .conversations
+            .contains_key(&parent.conversation_id)
+        {
+            let parent_until = match until {
+                Some(at) if at < parent.at => at,
+                _ => parent.at,
+            };
+            collect_visible_entries(
+                published,
+                parent.conversation_id,
+                Some(parent_until),
+                out,
+                seen,
+            )?;
+        }
     }
     if let Some(entries) = published.entries.get(&conversation_id) {
         for entry in entries {

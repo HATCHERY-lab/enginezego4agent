@@ -325,6 +325,19 @@ impl Storage for SqliteStorage {
         self.engine.borrow().scan_documents(query, limit, cursor)
     }
 
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.ensure()?;
+        self.engine.borrow().ensure_deletable(id)?;
+        {
+            let conn_guard = self.conn.borrow();
+            let conn = conn_guard
+                .as_ref()
+                .ok_or_else(|| Error::message("SqliteStorage is closed"))?;
+            delete_conversation_rows(conn, id)?;
+        }
+        self.engine.borrow_mut().delete_conversation(id)
+    }
+
     fn close(&self) -> Result<(), Error> {
         if self.closed.get() {
             return Ok(());
@@ -605,6 +618,72 @@ fn write_batch(tx: &Connection, batch: &BatchWrite) -> Result<(), Error> {
             )?;
         }
     }
+    Ok(())
+}
+
+/// Delete one conversation's rows in one transaction.
+///
+/// Children that point at `id` as parent stay in `conversations`; do not recurse.
+fn delete_conversation_rows(conn: &Connection, id: i64) -> Result<(), Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM document_revisions WHERE document_id IN (
+            SELECT id FROM documents
+            WHERE (scope_kind = 'conversation' AND owner_id = ?1)
+               OR (scope_kind = 'task' AND owner_id IN (
+                    SELECT id FROM tasks WHERE conversation_id = ?1
+               ))
+        )",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM record_ids WHERE id IN (
+            SELECT id FROM documents
+            WHERE (scope_kind = 'conversation' AND owner_id = ?1)
+               OR (scope_kind = 'task' AND owner_id IN (
+                    SELECT id FROM tasks WHERE conversation_id = ?1
+               ))
+        )",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM documents
+         WHERE (scope_kind = 'conversation' AND owner_id = ?1)
+            OR (scope_kind = 'task' AND owner_id IN (
+                SELECT id FROM tasks WHERE conversation_id = ?1
+            ))",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM record_ids WHERE id IN (SELECT id FROM entries WHERE conversation_id = ?1)",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM entries WHERE conversation_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM record_ids WHERE id IN (SELECT id FROM tasks WHERE conversation_id = ?1)",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM tasks WHERE conversation_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM record_ids WHERE id IN (SELECT id FROM submissions WHERE conversation_id = ?1)",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM submissions WHERE conversation_id = ?1",
+        params![id],
+    )?;
+    tx.execute("DELETE FROM record_ids WHERE id = ?1", params![id])?;
+    let removed = tx.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+    if removed == 0 {
+        return Err(Error::message(format!("Unknown conversation: {id}")));
+    }
+    tx.commit()?;
     Ok(())
 }
 

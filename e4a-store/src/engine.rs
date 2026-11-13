@@ -9,6 +9,7 @@ use e4a_types::{
     DocumentCreate, DocumentHistory, DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope,
     EntryHit, EntryQuery, EntryRecord, Json, Page, ScanOrder, StorageWrite, StoredDocument,
     SubmissionQuery, SubmissionRecord, SubmissionStatus, TaskQuery, TaskRecord, TaskStatus,
+    ROOT_CONVERSATION_ID,
 };
 
 use crate::Error;
@@ -323,10 +324,12 @@ impl Engine {
             };
             upper = cap_max(upper, parent.at);
             current = parent.conversation_id;
+            // Children that point at a deleted parent stay; that history is gone.
             if !self.conversations.contains_key(&current) {
-                return Err(unknown_conversation(current));
+                break;
             }
         }
+        Ok(None)
     }
 
     pub(crate) fn scan_entries(
@@ -1065,8 +1068,9 @@ impl Engine {
                     }
                 }
                 current = parent.conversation_id;
+                // Children that point at a deleted parent stay; that history is gone.
                 if !self.conversations.contains_key(&current) {
-                    return Err(unknown_conversation(current));
+                    break;
                 }
             }
             return Ok(());
@@ -1087,8 +1091,9 @@ impl Engine {
                 }
             }
             current = parent.conversation_id;
+            // Children that point at a deleted parent stay; that history is gone.
             if !self.conversations.contains_key(&current) {
-                return Err(unknown_conversation(current));
+                break;
             }
         }
         for (conversation_id, upper) in segments.into_iter().rev() {
@@ -1107,6 +1112,138 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn ensure_deletable(&self, id: i64) -> Result<(), Error> {
+        if id == ROOT_CONVERSATION_ID {
+            return Err(Error::message("The root cannot be deleted"));
+        }
+        if !self.conversations.contains_key(&id) {
+            return Err(unknown_conversation(id));
+        }
+        Ok(())
+    }
+
+    /// Remove one conversation and the rows that belong to it.
+    ///
+    /// Children that point at `id` as parent stay; do not recurse.
+    pub(crate) fn delete_conversation(&mut self, id: i64) -> Result<(), Error> {
+        self.ensure_deletable(id)?;
+        let record = match self.conversations.get(&id).cloned() {
+            Some(record) => record,
+            None => return Err(unknown_conversation(id)),
+        };
+        let entry_ids: Vec<i64> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.conversation_id == id)
+            .map(|(entry_id, _)| *entry_id)
+            .collect();
+        for entry_id in entry_ids {
+            self.entries.remove(&entry_id);
+            self.entry_commit_seqs.remove(&entry_id);
+            self.record_types.remove(&entry_id);
+        }
+        self.entry_ids.remove(&id);
+        self.head_entry_ids.remove(&id);
+
+        let task_ids: Vec<i64> = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.conversation_id == id)
+            .map(|(task_id, _)| *task_id)
+            .collect();
+        for task_id in task_ids {
+            self.remove_task(task_id);
+            self.remove_scope_documents(ScopeKey::Task(task_id));
+        }
+
+        let submission_ids: Vec<i64> = self
+            .submissions
+            .iter()
+            .filter(|(_, submission)| submission.conversation_id == id)
+            .map(|(submission_id, _)| *submission_id)
+            .collect();
+        for submission_id in submission_ids {
+            self.remove_submission(submission_id);
+        }
+        self.submission_by_request.remove(&id);
+        self.remove_scope_documents(ScopeKey::Conversation(id));
+
+        remove_sorted(&mut self.conversation_ids, id);
+        if let Some(owner) = record.owner {
+            remove_map_id(&mut self.by_owner_conversation, owner.conversation_id, id);
+            remove_map_id(&mut self.by_owner_task, owner.task_id, id);
+        }
+        self.record_types.remove(&id);
+        self.conversations.remove(&id);
+        Ok(())
+    }
+
+    fn remove_task(&mut self, id: i64) {
+        let Some(task) = self.tasks.remove(&id) else {
+            return;
+        };
+        remove_sorted(&mut self.task_ids, id);
+        remove_sorted(
+            task_bucket_mut(&mut self.task_buckets, task.state.status()),
+            id,
+        );
+        self.record_types.remove(&id);
+    }
+
+    fn remove_submission(&mut self, id: i64) {
+        let Some(record) = self.submissions.remove(&id) else {
+            return;
+        };
+        remove_sorted(&mut self.submission_ids, id);
+        remove_sorted(
+            submission_bucket_mut(&mut self.submission_buckets, record.status),
+            id,
+        );
+        if let Some(request_id) = record.request_id {
+            let mut empty = false;
+            if let Some(requests) = self.submission_by_request.get_mut(&record.conversation_id) {
+                if requests.get(&request_id) == Some(&id) {
+                    requests.remove(&request_id);
+                }
+                empty = requests.is_empty();
+            }
+            if empty {
+                self.submission_by_request.remove(&record.conversation_id);
+            }
+        }
+        self.record_types.remove(&id);
+    }
+
+    fn remove_scope_documents(&mut self, scope: ScopeKey) {
+        let ids: Vec<i64> = self
+            .documents
+            .iter()
+            .filter(|(_, stored)| scope_key(&stored.record.scope) == scope)
+            .map(|(id, _)| *id)
+            .collect();
+        self.document_ids_by_scope.remove(&scope);
+        for id in ids {
+            let Some(stored) = self.documents.remove(&id) else {
+                self.record_types.remove(&id);
+                continue;
+            };
+            let key = addr_key_record(&stored.record);
+            let empty = if let Some(address) = self.document_addresses.get_mut(&key) {
+                remove_sorted(&mut address.ids, id);
+                if address.current_id == Some(id) {
+                    address.current_id = None;
+                }
+                address.ids.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.document_addresses.remove(&key);
+            }
+            self.record_types.remove(&id);
+        }
     }
 
     fn bump(&mut self, id: i64) {
@@ -1356,6 +1493,18 @@ fn remove_sorted(ids: &mut Vec<i64>, id: i64) {
 
 fn insert_map_id(index: &mut HashMap<i64, Vec<i64>>, key: i64, id: i64) {
     insert_sorted(index.entry(key).or_default(), id);
+}
+
+fn remove_map_id(index: &mut HashMap<i64, Vec<i64>>, key: i64, id: i64) {
+    let empty = if let Some(ids) = index.get_mut(&key) {
+        remove_sorted(ids, id);
+        ids.is_empty()
+    } else {
+        false
+    };
+    if empty {
+        index.remove(&key);
+    }
 }
 
 fn below_min(id: i64, min: Option<i64>) -> bool {
