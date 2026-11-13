@@ -7,12 +7,12 @@ description = "Filesystem tools for agent4agent"
 publish = false
 
 [dependencies]
+e4a-harness = { path = "../e4a-harness" }
+e4a-llm = { path = "../e4a-llm" }
 e4a-session = { path = "../e4a-session" }
 e4a-types = { path = "../e4a-types" }
 serde_json = "1"
 thiserror = "1"
 
 [dev-dependencies]
-e4a-harness = { path = "../e4a-harness" }
-e4a-llm = { path = "../e4a-llm" }
 tokio = { version = "1", features = ["macros", "rt"] }

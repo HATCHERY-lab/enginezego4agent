@@ -1,10 +1,13 @@
 //! Filesystem tool slice. A waiting `pi.tool` task runs here and its result is committed.
-//! The model is not called.
+//! [`run_waiting_tool`] does not call a model. [`run_until_answer`] drives the generation
+//! until it answers.
 
 mod workspace;
 
 pub use workspace::{ToolEffect, Workspace};
 
+use e4a_harness::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP};
+use e4a_llm::Llm;
 use e4a_session::{EntryDraft, EntryRecord, Session, Tx};
 use e4a_types::{Json, TaskOutcome, TaskOutcomeError, TaskState};
 use serde_json::json;
@@ -40,12 +43,46 @@ impl From<e4a_session::Error> for Error {
     }
 }
 
+impl From<e4a_harness::Error> for Error {
+    fn from(error: e4a_harness::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
 struct PendingTool {
     conversation_id: i64,
     tool_task_id: i64,
     call_id: String,
     name: String,
     arguments: Json,
+}
+
+/// Run one generation until it answers or the model-call cap stops it.
+///
+/// [`Generation::turn`] runs once. While the outcome is [`TurnKind::WaitingTool`],
+/// the waiting tool runs and [`Generation::continue_after_tool`] resumes the same
+/// generation. [`TurnKind::Answered`] and [`TurnKind::RestartLimit`] stop the loop.
+/// An error from `continue_after_tool` is returned. At most [`MODEL_CALL_CAP`]
+/// tool rounds run, so a stuck `WaitingTool` cannot spin.
+pub async fn run_until_answer<L: Llm>(
+    session: &Session,
+    llm: &L,
+    workspace: &Workspace,
+    input: &TurnInput,
+) -> Result<TurnOutcome, Error> {
+    let mut outcome = Generation::turn(session, llm, input).await?;
+    let mut iterations = 0_i64;
+    while matches!(outcome.kind, TurnKind::WaitingTool { .. }) {
+        if iterations >= MODEL_CALL_CAP {
+            break;
+        }
+        run_waiting_tool(session, outcome.task_id, workspace).await?;
+        outcome = Generation::bind(outcome.task_id, input.conversation_id)
+            .continue_after_tool(session, llm)
+            .await?;
+        iterations = iterations.saturating_add(1);
+    }
+    Ok(outcome)
 }
 
 /// Run the waiting `pi.tool` task pointed at by the generation checkpoint `tools[0]`.

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use e4a_harness::{Generation, TurnInput, TurnKind, MODEL_CALL_CAP};
 use e4a_llm::{FauxLlm, ToolCall, ToolSchema};
 use e4a_session::{Session, TaskState, ROOT_CONVERSATION_ID};
-use e4a_tools::{run_waiting_tool, Workspace};
+use e4a_tools::{run_until_answer, run_waiting_tool, Workspace};
 use e4a_types::{TaskOutcome, TaskStatus};
 use serde_json::{json, Value};
 
@@ -564,6 +564,41 @@ async fn tool_loop_stops_after_four_model_calls() {
     assert_eq!(
         session.task(generation.task_id()).await.unwrap().unwrap().state.status(),
         TaskStatus::Terminal
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_until_answer_writes_then_answers() {
+    let (scratch, ws) = workspace();
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("")
+        .with_tool_call(ToolCall {
+            id: "call-1".into(),
+            name: "write".into(),
+            arguments: json!({ "path": "note.txt", "content": "hello" }),
+        })
+        .then(FauxLlm::text("wrote it"));
+    let done = run_until_answer(&session, &llm, &ws, &offered("write"))
+        .await
+        .unwrap();
+    let TurnKind::Answered { entry_id } = done.kind else {
+        panic!("expected an answer, got {:?}", done.kind);
+    };
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("note.txt")).unwrap(),
+        "hello"
+    );
+    assert_eq!(llm.calls(), 2);
+    assert_eq!(
+        session.task(done.task_id).await.unwrap().unwrap().state.status(),
+        TaskStatus::Terminal
+    );
+    let stored = session.entry(entry_id).await.unwrap().unwrap();
+    assert_eq!(stored.kind, "pi.assistant");
+    assert_eq!(
+        stored.model.unwrap()[0]["content"][0]["text"],
+        json!("wrote it")
     );
     session.close().await.unwrap();
 }
