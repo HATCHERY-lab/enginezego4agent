@@ -5,11 +5,24 @@
 //! `main.jsonl` holds one commit marker per line. Live document and task bodies sit in
 //! `doc-{id}.jsonl` and `task-{id}.jsonl`. A writable open drops torn tails and leftover
 //! `*.jsonl.reclaim` files; reclamation after that is best-effort.
+//!
+//! [`JsonlStorage`] is the session backend: it replays confirmed commits into the
+//! memory engine and appends sidecar records before each marker.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use e4a_types::{
+    CommitResult, ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
+    DocumentCreate, DocumentPoint, DocumentQuery, DocumentRecord, DocumentScope, EntryHit,
+    EntryQuery, EntryRecord, Page, StorageWrite, StoredDocument, SubmissionQuery, SubmissionRecord,
+    TaskQuery, TaskRecord, TaskStatus,
+};
 use serde_json::{Map, Value};
+
+use crate::engine::Engine;
+use crate::{Error, Storage};
 
 /// On-disk format. Markers and sidecar records carry this `format` number.
 pub const FORMAT_VERSION: i64 = 1;
@@ -141,12 +154,36 @@ impl JsonlWriter {
         }
         let line = append_line(value);
         let path = self.directory.join(MAIN_FILE);
-        if let Err(error) = append_bytes(&path, line.as_bytes()) {
+        if let Err(error) = append_bytes(&path, line.as_bytes(), &format!("append to {MAIN_FILE}"))
+        {
             self.mark_poisoned(&error);
             return Err(error);
         }
         self.last_seq = seq;
         self.main_line_count += 1;
+        Ok(())
+    }
+
+    /// Sidecar bytes first, then one marker per commit. Read-only writes nothing.
+    fn append_encoded(&mut self, commits: &[EncodedCommit]) -> Result<(), JsonlError> {
+        if let Some(poisoned) = &self.poison {
+            return Err(poisoned.clone());
+        }
+        if self.read_only {
+            return Err(JsonlError::ReadOnly);
+        }
+        for commit in commits {
+            for (name, content) in &commit.sidecars {
+                let path = self.directory.join(name);
+                if let Err(error) =
+                    append_bytes(&path, content.as_bytes(), &format!("append to {name}"))
+                {
+                    self.mark_poisoned(&error);
+                    return Err(error);
+                }
+            }
+            self.commit(&commit.marker)?;
+        }
         Ok(())
     }
 
@@ -282,6 +319,14 @@ fn validate_main_operation(value: &Value, description: &str) -> Result<(), Jsonl
             if obj.get("id").and_then(safe_i64).is_none() {
                 return Err(corruption(
                     format!("Invalid document retirement in {description}"),
+                    None,
+                ));
+            }
+        }
+        "conversation.delete" => {
+            if obj.get("id").and_then(safe_i64).is_none() {
+                return Err(corruption(
+                    format!("Invalid conversation delete in {description}"),
                     None,
                 ));
             }
@@ -999,10 +1044,17 @@ fn list_files(directory: &Path) -> Result<Vec<String>, JsonlError> {
         std::fs::read_dir(directory).map_err(|error| io_corruption("directory listing", error))?;
     let mut names = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| io_corruption("directory listing", error))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| io_corruption("directory listing", error))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A name can vanish between readdir and the next stat (#11994).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_corruption("directory listing", error)),
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_corruption("directory listing", error)),
+        };
         if !file_type.is_file() {
             continue;
         }
@@ -1110,15 +1162,675 @@ fn truncate_to(path: &Path, len: u64, action: &str) -> Result<(), JsonlError> {
     Ok(())
 }
 
-fn append_bytes(path: &Path, bytes: &[u8]) -> Result<(), JsonlError> {
+fn append_bytes(path: &Path, bytes: &[u8], action: &str) -> Result<(), JsonlError> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|error| io_corruption(&format!("append to {MAIN_FILE}"), error))?;
-    std::io::Write::write_all(&mut file, bytes)
-        .map_err(|error| io_corruption(&format!("append to {MAIN_FILE}"), error))?;
+        .map_err(|error| io_corruption(action, error))?;
+    std::io::Write::write_all(&mut file, bytes).map_err(|error| io_corruption(action, error))?;
     Ok(())
+}
+
+impl From<JsonlError> for Error {
+    fn from(error: JsonlError) -> Self {
+        Error::message(error.to_string())
+    }
+}
+
+struct EncodedCommit {
+    marker: Value,
+    sidecars: Vec<(String, String)>,
+}
+
+enum ReplayBatch {
+    Apply(Vec<StorageWrite>),
+    Deletes(Vec<i64>),
+}
+
+/// Session store for a JSONL directory.
+///
+/// A writable open creates the directory, repairs torn tails, and loads confirmed
+/// commits. Each stored batch appends its sidecar records, then one marker.
+/// Read-only commits are refused. A failure after a batch is applied poisons the handle.
+pub struct JsonlStorage {
+    engine: RefCell<Engine>,
+    writer: RefCell<JsonlWriter>,
+    closed: Cell<bool>,
+}
+
+impl JsonlStorage {
+    /// Open `directory` for writing. Creates it when missing.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, Error> {
+        let directory = directory.as_ref();
+        let writer = JsonlWriter::open(directory, false)?;
+        let engine = replay_engine(directory)?;
+        let expected = writer.last_seq.checked_add(1).ok_or_else(|| {
+            Error::message("JSONL commit sequence is exhausted")
+        })?;
+        if engine.next_seq() != expected {
+            return Err(Error::message(
+                "JSONL commit sequence does not match stored state",
+            ));
+        }
+        Ok(Self {
+            engine: RefCell::new(engine),
+            writer: RefCell::new(writer),
+            closed: Cell::new(false),
+        })
+    }
+
+    fn ensure(&self) -> Result<(), Error> {
+        if self.closed.get() {
+            return Err(Error::message("JsonlStorage is closed"));
+        }
+        if let Some(poison) = self.writer.borrow().poison.clone() {
+            return Err(Error::from(poison));
+        }
+        Ok(())
+    }
+
+    fn read<T>(&self, read: impl FnOnce(&Engine) -> Result<T, Error>) -> Result<T, Error> {
+        self.ensure()?;
+        read(&self.engine.borrow())
+    }
+}
+
+impl Storage for JsonlStorage {
+    fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut dyn FnMut(usize, i64),
+    ) -> Result<CommitResult, Error> {
+        self.ensure()?;
+        if self.writer.borrow().read_only {
+            return Err(JsonlError::ReadOnly.into());
+        }
+        let mut encoded = Vec::new();
+        let mut seqs = Vec::new();
+        let refused = {
+            let mut engine = self.engine.borrow_mut();
+            let mut refused = None;
+            for batch in batches {
+                let mut resolved = batch.clone();
+                let resolved_ok = resolve_copies_for_jsonl(&engine, &mut resolved).is_ok();
+                let outcome = engine.apply_batches(std::slice::from_ref(batch))?;
+                if let Some(reason) = outcome.refused {
+                    refused = Some(reason);
+                    break;
+                }
+                if !resolved_ok {
+                    let error = Error::message("JSONL encode saw a refused batch as stored");
+                    drop(engine);
+                    self.poison_with(&error);
+                    return Err(error);
+                }
+                let seq = outcome.seqs.first().copied().ok_or_else(|| {
+                    Error::message("JSONL commit assigned no sequence")
+                })?;
+                match encode_commit(seq, &resolved) {
+                    Ok(commit) => encoded.push(commit),
+                    Err(error) => {
+                        drop(engine);
+                        self.poison_with(&error);
+                        return Err(error);
+                    }
+                }
+                seqs.push(seq);
+            }
+            refused
+        };
+        if !encoded.is_empty() {
+            self.writer.borrow_mut().append_encoded(&encoded)?;
+        }
+        for (index, seq) in seqs.iter().enumerate() {
+            receive(index, *seq);
+        }
+        Ok(CommitResult {
+            stored: seqs.len(),
+            refused,
+        })
+    }
+
+    fn mint_id(&self) -> Result<i64, Error> {
+        self.ensure()?;
+        self.engine.borrow_mut().mint_id()
+    }
+
+    fn conversation(&self, id: i64) -> Result<Option<ConversationRecord>, Error> {
+        self.read(|engine| engine.conversation(id))
+    }
+
+    fn scan_conversations(
+        &self,
+        query: &ConversationQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<ConversationRecord>, Error> {
+        self.read(|engine| {
+            engine.scan_conversations(
+                query.owner_conversation_id,
+                query.owner_task_id,
+                query.order,
+                limit,
+                cursor,
+            )
+        })
+    }
+
+    fn entry(&self, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.read(|engine| engine.entry(id))
+    }
+
+    fn entry_in(&self, conversation_id: i64, id: i64) -> Result<Option<EntryHit>, Error> {
+        self.read(|engine| engine.entry_in(conversation_id, id))
+    }
+
+    fn find_latest_head_marker(
+        &self,
+        conversation_id: i64,
+        at_or_before: Option<i64>,
+    ) -> Result<Option<EntryRecord>, Error> {
+        self.read(|engine| engine.find_latest_head_marker(conversation_id, at_or_before))
+    }
+
+    fn scan_entries(
+        &self,
+        query: &EntryQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<EntryRecord>, Error> {
+        self.read(|engine| engine.scan_entries(query, limit, cursor))
+    }
+
+    fn task(&self, id: i64) -> Result<Option<TaskRecord>, Error> {
+        self.read(|engine| engine.task(id))
+    }
+
+    fn scan_tasks(
+        &self,
+        query: &TaskQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<TaskRecord>, Error> {
+        self.read(|engine| engine.scan_tasks(query, limit, cursor))
+    }
+
+    fn submission(&self, id: i64) -> Result<Option<SubmissionRecord>, Error> {
+        self.read(|engine| engine.submission(id))
+    }
+
+    fn scan_submissions(
+        &self,
+        query: &SubmissionQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<SubmissionRecord>, Error> {
+        self.read(|engine| engine.scan_submissions(query, limit, cursor))
+    }
+
+    fn submission_by_request(
+        &self,
+        conversation_id: i64,
+        request_id: &str,
+    ) -> Result<Option<SubmissionRecord>, Error> {
+        self.read(|engine| engine.submission_by_request(conversation_id, request_id))
+    }
+
+    fn find_document(
+        &self,
+        address: &DocumentAddress,
+        at: DocumentPoint,
+    ) -> Result<Option<DocumentRecord>, Error> {
+        self.read(|engine| engine.find_document(address, at))
+    }
+
+    fn document(&self, id: i64, at: DocumentPoint) -> Result<Option<StoredDocument>, Error> {
+        self.read(|engine| engine.document(id, at))
+    }
+
+    fn scan_documents(
+        &self,
+        query: &DocumentQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<DocumentRecord>, Error> {
+        self.read(|engine| engine.scan_documents(query, limit, cursor))
+    }
+
+    fn delete_conversation(&self, id: i64) -> Result<(), Error> {
+        self.ensure()?;
+        if self.writer.borrow().read_only {
+            return Err(JsonlError::ReadOnly.into());
+        }
+        self.engine.borrow().ensure_deletable(id)?;
+        let seq = self.engine.borrow().next_seq();
+        let marker = serde_json::json!({
+            "format": FORMAT_VERSION,
+            "type": "commit",
+            "seq": seq,
+            "writes": [{ "type": "conversation.delete", "id": id }],
+        });
+        self.writer.borrow_mut().append_encoded(&[EncodedCommit {
+            marker,
+            sidecars: Vec::new(),
+        }])?;
+        let mut engine = self.engine.borrow_mut();
+        if let Err(error) = engine.delete_conversation(id) {
+            drop(engine);
+            self.poison_with(&error);
+            return Err(error);
+        }
+        let Some(next_seq) = seq.checked_add(1) else {
+            drop(engine);
+            let error = Error::message("JSONL commit sequence is exhausted");
+            self.poison_with(&error);
+            return Err(error);
+        };
+        let next_id = engine.next_id();
+        engine.finish_load(next_id, next_seq);
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        self.closed.set(true);
+        Ok(())
+    }
+}
+
+impl JsonlStorage {
+    fn poison_with(&self, error: &Error) {
+        let cause = JsonlError::Corruption {
+            message: error.to_string(),
+            cause: None,
+        };
+        self.writer.borrow_mut().mark_poisoned(&cause);
+    }
+}
+
+fn encode_commit(seq: i64, writes: &[StorageWrite]) -> Result<EncodedCommit, Error> {
+    let mut main_writes = Vec::new();
+    let mut records: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut next_ordinal = 0i64;
+    for write in writes {
+        match write {
+            StorageWrite::Conversation { .. }
+            | StorageWrite::Entry { .. }
+            | StorageWrite::Submission { .. }
+            | StorageWrite::DocumentRetire { .. } => {
+                main_writes.push(serde_json::to_value(write)?);
+            }
+            StorageWrite::Task { value } => {
+                if value.state.status() == TaskStatus::Terminal {
+                    main_writes.push(serde_json::to_value(write)?);
+                } else {
+                    let file = sidecar_name(KIND_TASK, value.id).map_err(Error::message)?;
+                    let ordinal = push_sidecar(
+                        &mut records,
+                        &mut next_ordinal,
+                        seq,
+                        file,
+                        serde_json::json!({ "type": "task", "value": value }),
+                    );
+                    main_writes.push(serde_json::json!({
+                        "type": "task.sidecar",
+                        "id": value.id,
+                        "ordinal": ordinal,
+                    }));
+                }
+            }
+            StorageWrite::DocumentCreate { record, content } => {
+                let file = sidecar_name(KIND_DOC, record.id).map_err(Error::message)?;
+                let ordinal = push_sidecar(
+                    &mut records,
+                    &mut next_ordinal,
+                    seq,
+                    file,
+                    serde_json::json!({
+                        "type": "document",
+                        "id": record.id,
+                        "content": content,
+                    }),
+                );
+                main_writes.push(serde_json::json!({
+                    "type": "document.create",
+                    "record": record,
+                    "ordinal": ordinal,
+                }));
+            }
+            StorageWrite::DocumentChange { id, content } => {
+                let file = sidecar_name(KIND_DOC, *id).map_err(Error::message)?;
+                let ordinal = push_sidecar(
+                    &mut records,
+                    &mut next_ordinal,
+                    seq,
+                    file,
+                    serde_json::json!({
+                        "type": "document",
+                        "id": id,
+                        "content": content,
+                    }),
+                );
+                main_writes.push(serde_json::json!({
+                    "type": "document.change",
+                    "id": id,
+                    "ordinal": ordinal,
+                }));
+            }
+            StorageWrite::DocumentCopy { .. } => {
+                return Err(Error::message(
+                    "document copy was not resolved before JSONL encode",
+                ));
+            }
+        }
+    }
+    let sidecars = records
+        .into_iter()
+        .map(|(file, lines)| {
+            let mut content = String::new();
+            for line in lines {
+                content.push_str(&append_line(&line));
+            }
+            (file, content)
+        })
+        .collect();
+    Ok(EncodedCommit {
+        marker: serde_json::json!({
+            "format": FORMAT_VERSION,
+            "type": "commit",
+            "seq": seq,
+            "writes": main_writes,
+        }),
+        sidecars,
+    })
+}
+
+fn push_sidecar(
+    records: &mut Vec<(String, Vec<Value>)>,
+    next_ordinal: &mut i64,
+    seq: i64,
+    file: String,
+    payload: Value,
+) -> i64 {
+    let ordinal = *next_ordinal;
+    *next_ordinal = next_ordinal.saturating_add(1);
+    let record = serde_json::json!({
+        "format": FORMAT_VERSION,
+        "type": "record",
+        "seq": seq,
+        "ordinal": ordinal,
+        "payload": payload,
+    });
+    if let Some((_, lines)) = records.iter_mut().find(|(name, _)| name == &file) {
+        lines.push(record);
+    } else {
+        records.push((file, vec![record]));
+    }
+    ordinal
+}
+
+fn resolve_copies_for_jsonl(engine: &Engine, writes: &mut [StorageWrite]) -> Result<(), String> {
+    if !writes
+        .iter()
+        .any(|write| matches!(write, StorageWrite::DocumentCopy { .. }))
+    {
+        return Ok(());
+    }
+    let mut changed = HashSet::new();
+    for write in writes.iter() {
+        match write {
+            StorageWrite::DocumentCreate { record, .. }
+            | StorageWrite::DocumentCopy { record, .. } => {
+                changed.insert(record.id);
+            }
+            StorageWrite::DocumentChange { id, .. } | StorageWrite::DocumentRetire { id } => {
+                changed.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    for write in writes.iter_mut() {
+        let StorageWrite::DocumentCopy { record, source } = write else {
+            continue;
+        };
+        let copy_id = record.id;
+        let resolved = (|| -> Result<StorageWrite, String> {
+            if changed.contains(&source.id) {
+                return Err(format!(
+                    "Fork source document {} is changed in the copy batch",
+                    source.id
+                ));
+            }
+            let stored = engine
+                .document(source.id, source.at)
+                .map_err(|error| error.to_string())?;
+            let Some(stored) = stored else {
+                return Err(format!(
+                    "Fork source document {} cannot be read",
+                    source.id
+                ));
+            };
+            if !jsonl_copy_matches(&stored.record, record) {
+                return Err(format!(
+                    "Fork source document {} does not match the copied record",
+                    source.id
+                ));
+            }
+            Ok(StorageWrite::DocumentCreate {
+                record: record.clone(),
+                content: DocumentContent::Base {
+                    version: stored.version,
+                    value: stored.value,
+                },
+            })
+        })();
+        match resolved {
+            Ok(create) => *write = create,
+            Err(_) => return Err(format!("Document copy {copy_id} was rejected")),
+        }
+    }
+    Ok(())
+}
+
+fn jsonl_copy_matches(stored: &DocumentRecord, record: &DocumentCreate) -> bool {
+    matches!(stored.scope, DocumentScope::Conversation { .. })
+        && matches!(record.scope, DocumentScope::Conversation { .. })
+        && stored.kind == record.kind
+        && stored.key == record.key
+        && stored.history == record.history
+        && stored.fork == record.fork
+}
+
+fn replay_engine(directory: &Path) -> Result<Engine, JsonlError> {
+    let main_path = directory.join(MAIN_FILE);
+    let main_lines = read_text_lines(&main_path, MAIN_FILE, true, parse_main_line)?;
+    let names = list_files(directory)?;
+    let files = load_sidecars(directory, &names, true)?;
+    let records = index_records(&files);
+    let index = classify_markers(&main_lines)?;
+    let bases = latest_bases(&main_lines, &index.current_only, &records)?;
+    confirm_markers(&main_lines, &index, &bases, &records)?;
+    let mut engine = Engine::new();
+    for line in &main_lines {
+        match replay_marker(line, &index, &bases, &records)? {
+            ReplayBatch::Apply(writes) => apply_replay(&mut engine, line.seq, writes)?,
+            ReplayBatch::Deletes(ids) => delete_replay(&mut engine, line.seq, &ids)?,
+        }
+    }
+    Ok(engine)
+}
+
+fn apply_replay(engine: &mut Engine, seq: i64, writes: Vec<StorageWrite>) -> Result<(), JsonlError> {
+    if engine.next_seq() != seq {
+        return Err(corruption(
+            format!("Commit sequence does not match stored state in {MAIN_FILE}"),
+            None,
+        ));
+    }
+    let outcome = engine.apply_batches(&[writes]).map_err(|error| {
+        corruption(
+            format!("Invalid committed state at sequence {seq}"),
+            Some(error.to_string()),
+        )
+    })?;
+    if outcome.refused.is_some() || outcome.seqs.first().copied() != Some(seq) {
+        return Err(corruption(
+            format!("Invalid committed state at sequence {seq}"),
+            outcome.refused,
+        ));
+    }
+    Ok(())
+}
+
+fn delete_replay(engine: &mut Engine, seq: i64, ids: &[i64]) -> Result<(), JsonlError> {
+    if engine.next_seq() != seq {
+        return Err(corruption(
+            format!("Commit sequence does not match stored state in {MAIN_FILE}"),
+            None,
+        ));
+    }
+    for id in ids {
+        engine.delete_conversation(*id).map_err(|error| {
+            corruption(
+                format!("Invalid committed state at sequence {seq}"),
+                Some(error.to_string()),
+            )
+        })?;
+    }
+    let next_id = engine.next_id();
+    engine.finish_load(next_id, seq.saturating_add(1));
+    Ok(())
+}
+
+macro_rules! parse_state {
+    ($value:expr, $seq:expr) => {
+        serde_json::from_value($value).map_err(|error| {
+            corruption(
+                format!("Invalid committed state at sequence {}", $seq),
+                Some(error.to_string()),
+            )
+        })
+    };
+}
+
+fn replay_marker(
+    line: &TextLine,
+    index: &MarkerIndex,
+    bases: &HashMap<i64, BasePos>,
+    records: &HashMap<RecKey, Value>,
+) -> Result<ReplayBatch, JsonlError> {
+    let seq = line.seq;
+    let mut writes = Vec::new();
+    let mut deletes = Vec::new();
+    let retired_current_only = retired_current_only(index);
+    let terminal = terminal_tasks(index);
+    for write in writes_of(&line.value)? {
+        match write.get("type").and_then(Value::as_str) {
+            Some("conversation.delete") => {
+                deletes.push(field_i64(write, "id", "Invalid conversation delete")?);
+            }
+            Some("conversation") | Some("entry") | Some("submission") | Some("task")
+            | Some("document.retire") => {
+                writes.push(parse_state!(write.clone(), seq)?);
+            }
+            Some("task.sidecar") => {
+                let id = field_i64(write, "id", "Invalid task sidecar write")?;
+                let ordinal = field_i64(write, "ordinal", "Invalid task sidecar write")?;
+                if terminal.contains(&id) {
+                    continue;
+                }
+                let payload = sidecar_payload(records, &sidecar_file(KIND_TASK, id), seq, ordinal)
+                    .ok_or_else(|| missing_sidecar(&sidecar_file(KIND_TASK, id), seq))?;
+                let value = payload.get("value").cloned().ok_or_else(|| {
+                    corruption(format!("Invalid live task record in {MAIN_FILE}"), None)
+                })?;
+                let value: TaskRecord = parse_state!(value, seq)?;
+                writes.push(StorageWrite::Task { value });
+            }
+            Some("document.create") => {
+                let record_value = write.get("record").cloned().ok_or_else(|| {
+                    corruption(format!("Invalid document creation in {MAIN_FILE}"), None)
+                })?;
+                let id = record_value.get("id").and_then(safe_i64).ok_or_else(|| {
+                    corruption(format!("Invalid document creation in {MAIN_FILE}"), None)
+                })?;
+                let ordinal = field_i64(write, "ordinal", "Invalid document write")?;
+                let reclaimed = retired_current_only.contains(&id)
+                    || is_before_base(bases.get(&id).copied(), seq, ordinal);
+                let content = if reclaimed {
+                    DocumentContent::Base {
+                        version: 1,
+                        value: serde_json::json!({}),
+                    }
+                } else {
+                    let payload =
+                        sidecar_payload(records, &sidecar_file(KIND_DOC, id), seq, ordinal)
+                            .ok_or_else(|| missing_sidecar(&sidecar_file(KIND_DOC, id), seq))?;
+                    let content = payload.get("content").cloned().ok_or_else(|| {
+                        corruption(format!("Invalid document content in {MAIN_FILE}"), None)
+                    })?;
+                    let content: DocumentContent = parse_state!(content, seq)?;
+                    content
+                };
+                let record: DocumentCreate = parse_state!(record_value, seq)?;
+                writes.push(StorageWrite::DocumentCreate { record, content });
+            }
+            Some("document.change") => {
+                let id = field_i64(write, "id", "Invalid document change")?;
+                let ordinal = field_i64(write, "ordinal", "Invalid document write")?;
+                let reclaimed = retired_current_only.contains(&id)
+                    || is_before_base(bases.get(&id).copied(), seq, ordinal);
+                if reclaimed {
+                    continue;
+                }
+                let payload = sidecar_payload(records, &sidecar_file(KIND_DOC, id), seq, ordinal)
+                    .ok_or_else(|| missing_sidecar(&sidecar_file(KIND_DOC, id), seq))?;
+                let content = payload.get("content").cloned().ok_or_else(|| {
+                    corruption(format!("Invalid document content in {MAIN_FILE}"), None)
+                })?;
+                let content: DocumentContent = parse_state!(content, seq)?;
+                writes.push(StorageWrite::DocumentChange { id, content });
+            }
+            _ => {
+                return Err(corruption(
+                    format!("Unknown write type in {MAIN_FILE}"),
+                    None,
+                ));
+            }
+        }
+    }
+    if !deletes.is_empty() && !writes.is_empty() {
+        return Err(corruption(
+            format!("Invalid commit marker in {MAIN_FILE}"),
+            None,
+        ));
+    }
+    if deletes.is_empty() {
+        Ok(ReplayBatch::Apply(writes))
+    } else {
+        Ok(ReplayBatch::Deletes(deletes))
+    }
+}
+
+fn sidecar_payload<'a>(
+    records: &'a HashMap<RecKey, Value>,
+    file: &str,
+    seq: i64,
+    ordinal: i64,
+) -> Option<&'a Value> {
+    records.get(&RecKey {
+        file: file.to_string(),
+        seq,
+        ordinal,
+    })
+    .and_then(|record| record.get("payload"))
+}
+
+fn missing_sidecar(file: &str, seq: i64) -> JsonlError {
+    corruption(
+        format!("Missing confirmed sidecar record {file} at sequence {seq}"),
+        None,
+    )
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use e4a_store::{MemoryStorage, SqliteStorage, Storage};
+use e4a_store::{JsonlStorage, MemoryStorage, SqliteStorage, Storage};
 use e4a_types::{
     ConversationRecord, DocumentAddress, DocumentQuery, DocumentScope, EntryQuery, EntryRecord,
     Json, ScanOrder, TaskQuery, ROOT_CONVERSATION_ID,
@@ -60,8 +60,8 @@ impl Session {
         Self::open(move || SqliteStorage::open(&path)).await
     }
 
-    /// SQLite opens a session. JSONL and IndexedDB run their openers, then fail:
-    /// those stores are not session backends yet.
+    /// SQLite and JSONL open a session. IndexedDB runs its opener, then fails:
+    /// that store is not a session backend yet.
     pub async fn open_kind(kind: StoreKind, path: &Path) -> Result<Self, Error> {
         match kind {
             StoreKind::Sqlite => Self::sqlite(path).await,
@@ -69,11 +69,8 @@ impl Session {
                 if path.as_os_str().is_empty() {
                     return Err(Error::message("empty path"));
                 }
-                // Writable open: a session would append, and `false` creates the directory.
-                let writer = e4a_store::JsonlWriter::open(path, false)
-                    .map_err(|error| Error::message(error.to_string()))?;
-                drop(writer);
-                Err(Error::message("jsonl session is not wired"))
+                let path = path.to_path_buf();
+                Self::open(move || JsonlStorage::open(&path)).await
             }
             StoreKind::Idb => {
                 let name = path.display().to_string();
