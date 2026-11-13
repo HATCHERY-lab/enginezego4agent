@@ -4,12 +4,14 @@
 
 mod apply;
 mod coerce;
+mod ids;
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub use apply::{apply, ApplyError, Op, Path, Seg};
 pub use coerce::coerce;
+pub use ids::{doc_key, entry_visible, next_id};
 
 pub type Json = serde_json::Value;
 

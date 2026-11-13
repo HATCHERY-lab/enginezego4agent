@@ -4,10 +4,12 @@
 
 mod engine;
 mod memory;
+mod scan_page;
 mod sqlite;
 
 pub use e4a_types::*;
 pub use memory::MemoryStorage;
+pub use scan_page::page;
 pub use sqlite::SqliteStorage;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
