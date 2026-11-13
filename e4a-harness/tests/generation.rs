@@ -55,6 +55,39 @@ async fn high_usage_writes_compaction_and_the_next_request_drops_the_old_text() 
 }
 
 #[tokio::test]
+async fn next_request_drops_a_tool_call_that_never_returned() {
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("").with_tool_call(ToolCall {
+        id: "c1".into(),
+        name: "powershell".into(),
+        arguments: json!({"command": "Start-Sleep -Seconds 25"}),
+    });
+    let outcome = Generation::turn(
+        &session,
+        &llm,
+        &input(
+            "sleep",
+            vec![ToolSchema {
+                name: "powershell".into(),
+                description: "shell".into(),
+                parameters: json!({"type": "object"}),
+            }],
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome.kind, TurnKind::WaitingTool { .. }));
+    let next = FauxLlm::text("ok");
+    Generation::turn(&session, &next, &input("read note", Vec::new()))
+        .await
+        .unwrap();
+    let blob = format!("{:?}", next.requests()[0]);
+    assert!(!blob.contains("Start-Sleep"), "{blob}");
+    assert!(blob.contains("read note"), "{blob}");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn text_turn_publishes_assistant_and_usage() {
     let session = Session::memory().await.unwrap();
     let llm = FauxLlm::text("hello").with_usage(usage(11, 7));

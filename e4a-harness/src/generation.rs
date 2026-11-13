@@ -576,7 +576,7 @@ fn turn_request(
         .filter(|entry| entry.kind == "pi.compaction" && entry.id <= checkpoint.cutoff)
         .filter_map(|entry| entry.head)
         .max();
-    let messages = entries
+    let mut messages = entries
         .into_iter()
         .filter(|entry| entry.id <= checkpoint.cutoff)
         .filter(|entry| match covered {
@@ -585,6 +585,7 @@ fn turn_request(
         })
         .filter_map(|entry| message_from_entry(&entry))
         .collect::<Vec<_>>();
+    drop_unanswered_tool_calls(&mut messages);
     if messages.is_empty() {
         return Err(e4a_session::Error::message(
             "the conversation has nothing to answer",
@@ -594,6 +595,27 @@ fn turn_request(
         messages,
         tools: input.tools,
     })
+}
+
+/// A killed tool leaves an assistant tool call with no `pi.toolResult`.
+/// The next provider request must not include that call.
+fn drop_unanswered_tool_calls(messages: &mut Vec<ChatMessage>) {
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect();
+    for message in messages.iter_mut() {
+        message
+            .tool_calls
+            .retain(|call| answered.contains(&call.id));
+    }
+    messages.retain(|message| {
+        message.role == "tool"
+            || message.role == "user"
+            || !message.text.is_empty()
+            || !message.tool_calls.is_empty()
+    });
 }
 
 fn load_task(tx: &mut Tx, task_id: i64) -> Result<TaskRecord, e4a_session::Error> {
