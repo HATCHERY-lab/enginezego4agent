@@ -54,6 +54,11 @@ impl ProviderSessions {
     }
 }
 
+/// Close path for issue #11676. Returns the ids [`ProviderSessions::release`] forgets.
+pub fn shutdown(sessions: &mut ProviderSessions, harness_id: &str) -> Vec<String> {
+    sessions.release(harness_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +95,20 @@ mod tests {
         assert!(!sessions.contains("", "prov-a"));
         assert!(!sessions.contains("a", ""));
         assert!(sessions.release("a").is_empty());
+    }
+
+    #[test]
+    fn shutdown_releases_that_harness() {
+        let mut sessions = ProviderSessions::default();
+        sessions.remember("a", "prov-b").unwrap();
+        sessions.remember("a", "prov-a").unwrap();
+        sessions.remember("b", "prov-kept").unwrap();
+        assert_eq!(
+            shutdown(&mut sessions, "a"),
+            vec!["prov-a".to_owned(), "prov-b".to_owned()]
+        );
+        assert!(sessions.contains("b", "prov-kept"));
+        assert!(!sessions.contains("a", "prov-a"));
+        assert!(shutdown(&mut sessions, "a").is_empty());
     }
 }

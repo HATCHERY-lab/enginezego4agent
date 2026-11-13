@@ -54,6 +54,8 @@ mod usage;
 mod view;
 mod view_sub;
 mod provider_close;
+mod scheduler_loop;
+mod gate;
 
 pub use advisor::advisor_tools;
 pub use advisor_agent::{advisor_agent, advisor_fallback};
@@ -119,6 +121,9 @@ pub use usage::usage_doc;
 pub use view::window;
 pub use view_sub::on_lines;
 pub use provider_close::ProviderSessions;
+pub use scheduler_loop::{crash_task, drive_pass};
+pub use gate::Gate;
+pub use provider_close::shutdown;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
