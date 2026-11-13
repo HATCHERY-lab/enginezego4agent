@@ -93,7 +93,11 @@ fn chat_message_without_tool_fields_parses() {
 #[tokio::test]
 async fn openrouter_is_not_wired() {
     let client = OpenRouterClient::new("openrouter::test/model");
-    let error = client.stream(&request()).await.unwrap_err();
-    assert_eq!(error.to_string(), "live client not wired");
     assert_eq!(client.model(), "openrouter::test/model");
+    // A configured door would dial. This test never opens a socket.
+    if std::env::var_os("E4A_SOCKS").is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+    let error = client.stream(&request()).await.unwrap_err();
+    assert_eq!(error.to_string(), "E4A_SOCKS is unset");
 }
