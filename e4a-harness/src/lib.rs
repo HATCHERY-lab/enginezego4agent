@@ -1,6 +1,7 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
 mod advisor;
+mod advisor_agent;
 mod broker;
 mod compaction;
 mod compaction_job;
@@ -48,6 +49,7 @@ mod view;
 mod view_sub;
 
 pub use advisor::advisor_tools;
+pub use advisor_agent::{advisor_agent, fallback_model, AgentRole};
 pub use broker::{broker, KeyBroker};
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
