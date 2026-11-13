@@ -89,11 +89,7 @@ pub async fn run_until_answer<L: Llm>(
         if iterations >= MODEL_CALL_CAP {
             break;
         }
-        if std::env::var("E4A_JEV").ok().as_deref() == Some("1") {
-            run_waiting_gated(session, outcome.task_id, workspace, Some(llm)).await?;
-        } else {
-            run_waiting_tool(session, outcome.task_id, workspace).await?;
-        }
+        run_waiting_gated(session, outcome.task_id, workspace, Some(llm)).await?;
         outcome = Generation::bind(outcome.task_id, input.conversation_id)
             .continue_after_tool(session, llm)
             .await?;
@@ -123,34 +119,38 @@ async fn run_waiting_gated<L: Llm>(
     llm: Option<&L>,
 ) -> Result<ToolOutcome, Error> {
     let pending = load_waiting(session, generation_task_id).await?;
-    let decision = match llm {
-        Some(llm) => {
-            crate::jev_gate::run_jev_gate(
-                llm,
-                workspace,
-                &pending.name,
-                &pending.arguments,
-                0,
-            )
-            .await?
+    let effect = if pending.name == "jev" {
+        let Some(llm) = llm else {
+            return Err(Error::message("jev needs a model"));
+        };
+        let question = pending
+            .arguments
+            .get("question")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let decision = crate::jev_gate::run_jev_ask(llm, workspace, question).await?;
+        ToolEffect {
+            is_error: false,
+            content: crate::jev_gate::render(&decision),
         }
-        None => e4a_harness::decide(e4a_harness::JevSnap {
+    } else {
+        let decision = e4a_harness::decide(e4a_harness::JevSnap {
             tool: &pending.name,
             arguments: &pending.arguments,
             transcript_chars: 0,
-        }),
-    };
-    let effect = match decision {
-        e4a_harness::JevDecision::Stop { reason } => ToolEffect {
-            is_error: true,
-            content: reason.to_string(),
-        },
-        e4a_harness::JevDecision::Steer { text } => ToolEffect {
-            is_error: true,
-            content: text,
-        },
-        e4a_harness::JevDecision::Continue | e4a_harness::JevDecision::Compact => {
-            workspace.call(&pending.name, &pending.arguments)
+        });
+        match decision {
+            e4a_harness::JevDecision::Stop { reason } => ToolEffect {
+                is_error: true,
+                content: reason.to_string(),
+            },
+            e4a_harness::JevDecision::Steer { text } => ToolEffect {
+                is_error: true,
+                content: text,
+            },
+            e4a_harness::JevDecision::Continue | e4a_harness::JevDecision::Compact => {
+                workspace.call(&pending.name, &pending.arguments)
+            }
         }
     };
     let entry_id = session
