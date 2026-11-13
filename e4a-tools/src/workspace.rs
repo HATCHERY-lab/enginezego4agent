@@ -90,7 +90,8 @@ impl Workspace {
         write_file(&self.root, &resolved, &updated)
     }
 
-    /// Dispatch `read`, `write`, or `edit`. An unknown name is an error result.
+    /// Dispatch `read`, `write`, `edit`, `bash`, or `powershell`.
+    /// An unknown name is an error result.
     pub fn call(&self, name: &str, arguments: &Json) -> ToolEffect {
         match self.execute(name, arguments) {
             Ok(content) => ToolEffect {
@@ -123,6 +124,8 @@ impl Workspace {
                 self.edit(path, old, new)?;
                 Ok(format!("edited {path}"))
             }
+            "bash" => crate::shell::bash(&self.root, arguments),
+            "powershell" => crate::shell::powershell(&self.root, arguments),
             other => Err(Error::message(format!("unknown tool {other}"))),
         }
     }

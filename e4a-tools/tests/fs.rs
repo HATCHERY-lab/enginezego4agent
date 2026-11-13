@@ -190,12 +190,25 @@ fn read_rejects_oversize_and_non_utf8() {
 #[test]
 fn unknown_tool_is_an_error_result() {
     let (_scratch, ws) = workspace();
-    let effect = ws.call("bash", &json!({ "cmd": "whoami" }));
+    let effect = ws.call("not-a-tool", &json!({ "path": "x" }));
     assert!(effect.is_error);
     assert!(effect.content.contains("unknown tool"));
-    let effect = ws.call("powershell", &json!({}));
+    let effect = ws.call("also-unknown", &json!({}));
     assert!(effect.is_error);
     assert!(effect.content.contains("unknown tool"));
+}
+
+#[test]
+fn shell_empty_command_is_an_error_result() {
+    let (_scratch, ws) = workspace();
+    for name in ["bash", "powershell"] {
+        let empty = ws.call(name, &json!({ "command": "" }));
+        assert!(empty.is_error, "{}", empty.content);
+        assert!(empty.content.contains("empty"));
+        let missing = ws.call(name, &json!({}));
+        assert!(missing.is_error, "{}", missing.content);
+        assert!(missing.content.contains("required"));
+    }
 }
 
 #[test]
@@ -344,10 +357,10 @@ async fn waiting_tool_refuses_paths_outside_the_workspace() {
 async fn unknown_tool_commits_an_error_result() {
     let (_scratch, ws) = workspace();
     let session = Session::memory().await.unwrap();
-    let generation_id = tool_turn(&session, "bash", json!({ "path": "x" })).await;
+    let generation_id = tool_turn(&session, "not-a-tool", json!({ "path": "x" })).await;
     let outcome = run_waiting_tool(&session, generation_id, &ws).await.unwrap();
     assert!(outcome.is_error);
-    assert!(outcome.content.contains("unknown tool bash"));
+    assert!(outcome.content.contains("unknown tool not-a-tool"));
     let entry = session.entry(outcome.entry_id).await.unwrap().unwrap();
     assert_eq!(entry.kind, "pi.toolResult");
     assert_eq!(entry.model.unwrap()[0]["isError"], json!(true));
