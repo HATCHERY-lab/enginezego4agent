@@ -4,10 +4,13 @@
 //!
 //! No model call and no async. The queue does not run task code.
 //!
-//! Unreleased main after tag v1.5.2 is not ported. That main implements suspendable
-//! work (signals, tools that park, gates, hook tasks), breaks code-mode namespaces,
-//! and fixes the wait-promise handler. This queue keeps the 1.5.2 obligation: a
-//! waiter dropped before [`Waiter::observe`] stores its error string.
+//! Unreleased main after tag v1.5.2 is not ported: suspendable work (signals,
+//! tools that park, gates, hook tasks) and the code-mode namespace break stay
+//! out. The wait-promise failure is recorded here. [`Scheduler::wait`] stores
+//! that string before it returns. [`Scheduler::take_wait_error`] polls one copy
+//! off. Nothing else removes it. A caller that never polls leaves the string.
+//! A waiter dropped before [`Waiter::observe`] still appends a copy to
+//! [`Scheduler::dropped_errors`] and does not delete the polled one.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,6 +41,11 @@ struct Inner {
     records: HashMap<u64, WaiterRecord>,
     next_id: u64,
     dropped_errors: Vec<String>,
+    /// Failure strings keyed by task or submission id, in record order.
+    ///
+    /// `wait` and `admit` push before they return. [`Scheduler::take_wait_error`]
+    /// pops one. Drop, with or without [`Waiter::observe`], does not.
+    wait_errors: HashMap<i64, VecDeque<String>>,
 }
 
 #[derive(Debug)]
@@ -56,7 +64,8 @@ struct LateDrop {
 /// One watcher of a task id.
 ///
 /// Dropping the guard before [`Waiter::observe`] appends its error string to the
-/// scheduler. `observe` consumes the wait and stores nothing.
+/// scheduler and leaves the copy [`Scheduler::take_wait_error`] reads.
+/// `observe` consumes the wait and stores nothing on the drop list.
 #[derive(Debug)]
 pub struct Waiter {
     shared: Rc<Shared>,
@@ -112,17 +121,47 @@ impl Scheduler {
         self.shared.inner.borrow().dropped_errors.clone()
     }
 
+    /// Poll one failure string recorded for `id` before `wait` or `admit` returned.
+    ///
+    /// `None` when that id has nothing left. Not calling this leaves the string.
+    pub fn take_wait_error(&self, id: i64) -> Option<String> {
+        flush(&self.shared);
+        self.shared.inner.borrow_mut().take_wait_error(id)
+    }
+
+    /// Store `error` for [`Scheduler::take_wait_error`] before the caller returns it.
+    pub(crate) fn record_wait_failure(&self, id: i64, error: String) {
+        flush(&self.shared);
+        self.shared.inner.borrow_mut().push_wait_error(id, error);
+    }
+
     /// Watch `task_id`.
     ///
-    /// `error` is stored if the returned waiter is dropped before [`Waiter::observe`].
+    /// `error` is recorded before this returns. Dropping the waiter before
+    /// [`Waiter::observe`] appends it to [`Scheduler::dropped_errors`] and does
+    /// not remove the recorded copy. [`Scheduler::take_wait_error`] polls it.
+    /// An empty `error` is rejected after that rejection text is recorded.
     pub fn wait(&self, task_id: i64, error: impl Into<String>) -> Result<Waiter, Error> {
         flush(&self.shared);
         let error = error.into();
         if error.is_empty() {
-            return Err(Error::message("waiter error must not be empty"));
+            let failure = "waiter error must not be empty".to_owned();
+            self.shared
+                .inner
+                .borrow_mut()
+                .push_wait_error(task_id, failure.clone());
+            return Err(Error::message(failure));
         }
         let mut inner = self.shared.inner.borrow_mut();
-        let id = inner.alloc_id()?;
+        let id = match inner.alloc_id() {
+            Ok(id) => id,
+            Err(failure) => {
+                let message = failure.to_string();
+                inner.push_wait_error(task_id, message);
+                return Err(failure);
+            }
+        };
+        inner.push_wait_error(task_id, error.clone());
         inner.records.insert(
             id,
             WaiterRecord {
@@ -224,6 +263,22 @@ impl Inner {
             self.dropped_errors.push(record.error);
         }
     }
+
+    fn push_wait_error(&mut self, id: i64, error: String) {
+        self.wait_errors.entry(id).or_default().push_back(error);
+    }
+
+    fn take_wait_error(&mut self, id: i64) -> Option<String> {
+        let error = self.wait_errors.get_mut(&id)?.pop_front()?;
+        if self
+            .wait_errors
+            .get(&id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.wait_errors.remove(&id);
+        }
+        Some(error)
+    }
 }
 
 fn flush(shared: &Shared) {
@@ -283,6 +338,8 @@ mod tests {
         second.observe();
         assert_eq!(sched.dropped_errors(), vec!["gone".to_string()]);
         assert!(sched.waiters(5).is_empty());
+        assert_eq!(sched.take_wait_error(5).as_deref(), Some("gone"));
+        assert_eq!(sched.take_wait_error(5).as_deref(), Some("stay"));
     }
 
     #[test]
@@ -292,6 +349,7 @@ mod tests {
         waiter.observe();
         assert!(sched.dropped_errors().is_empty());
         assert!(sched.waiters(4).is_empty());
+        assert_eq!(sched.take_wait_error(4).as_deref(), Some("seen"));
     }
 
     #[test]
@@ -300,6 +358,10 @@ mod tests {
         let error = sched.wait(1, "").unwrap_err();
         assert_eq!(error.to_string(), "waiter error must not be empty");
         assert!(sched.waiters(1).is_empty());
+        assert_eq!(
+            sched.take_wait_error(1).as_deref(),
+            Some("waiter error must not be empty")
+        );
     }
 
     #[test]
@@ -312,5 +374,24 @@ mod tests {
         }
         assert_eq!(sched.dropped_errors(), vec!["late".to_string()]);
         assert!(sched.waiters(1).is_empty());
+        assert_eq!(sched.take_wait_error(1).as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn failed_wait_keeps_its_string() {
+        let sched = Scheduler::new();
+        drop(sched.wait(9, "").unwrap_err());
+        let waiter = sched.wait(9, "session aborted").unwrap();
+        drop(waiter);
+        assert_eq!(sched.pop_ready(), None);
+        assert_eq!(
+            sched.take_wait_error(9).as_deref(),
+            Some("waiter error must not be empty")
+        );
+        assert_eq!(
+            sched.take_wait_error(9).as_deref(),
+            Some("session aborted")
+        );
+        assert!(sched.take_wait_error(9).is_none());
     }
 }
