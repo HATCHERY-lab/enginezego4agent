@@ -2,6 +2,7 @@
 
 //! Session kernel: one mutation line, group-commit writer thread, publication of committed state.
 
+mod backend;
 mod cache;
 mod docs;
 mod forks;
@@ -16,6 +17,7 @@ mod tx;
 mod tx_ops;
 mod view;
 
+pub use backend::{describe, parse_kind, StoreKind};
 pub use cache::{admits, evict_oldest, Cache};
 pub use docs::{
     agent_doc, compaction_fields, provider_doc, address_id, Checkpoint, CompactionSettings, DocDef,
