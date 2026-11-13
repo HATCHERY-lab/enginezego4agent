@@ -330,11 +330,20 @@ pub fn check_classifier_context(context: Option<&Value>) -> Result<ClassifierCon
             describe_value(context)
         )));
     };
-    let Some(state) = map.get("state").and_then(Value::as_object) else {
-        return Err(classify_fail(&format!(
-            "context.state must be an object, got {}",
-            describe_value(map.get("state"))
-        )));
+    let state = match map.get("state") {
+        Some(Value::Object(state)) => state,
+        Some(other) => {
+            return Err(classify_fail(&format!(
+                "context.state must be an object, got {}",
+                describe_value(Some(other))
+            )));
+        }
+        None => {
+            return Err(classify_fail(&format!(
+                "context.state must be an object, got {}",
+                describe_value(Some(&Value::Object(map.clone())))
+            )));
+        }
     };
     let images = match map.get("images") {
         None => None,
