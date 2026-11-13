@@ -17,7 +17,7 @@ use crate::keys::{conversation_key, document_key, entry_key, submission_key, tas
 use crate::store::StoreHandle;
 use crate::tx::{empty_scope, Adopted, AdoptedDocument, Tx};
 use crate::view::{window_entries, ConversationView, ConversationWindow};
-use crate::Error;
+use crate::{Error, StoreKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEnd {
@@ -58,6 +58,30 @@ impl Session {
     pub async fn sqlite(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = PathBuf::from(path.as_ref());
         Self::open(move || SqliteStorage::open(&path)).await
+    }
+
+    /// SQLite opens a session. JSONL and IndexedDB run their openers, then fail:
+    /// those stores are not session backends yet.
+    pub async fn open_kind(kind: StoreKind, path: &Path) -> Result<Self, Error> {
+        match kind {
+            StoreKind::Sqlite => Self::sqlite(path).await,
+            StoreKind::Jsonl => {
+                if path.as_os_str().is_empty() {
+                    return Err(Error::message("empty path"));
+                }
+                // Writable open: a session would append, and `false` creates the directory.
+                let writer = e4a_store::JsonlWriter::open(path, false)
+                    .map_err(|error| Error::message(error.to_string()))?;
+                drop(writer);
+                Err(Error::message("jsonl session is not wired"))
+            }
+            StoreKind::Idb => {
+                let name = path.display().to_string();
+                let database = e4a_store::open(&name).map_err(Error::message)?;
+                drop(database);
+                Err(Error::message("idb session is not wired"))
+            }
+        }
     }
 
     async fn open<S, F>(factory: F) -> Result<Self, Error>
