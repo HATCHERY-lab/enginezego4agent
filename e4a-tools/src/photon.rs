@@ -54,6 +54,8 @@ pub fn resize_png(bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
         h,
         photon_rs::transform::SamplingFilter::Lanczos3,
     );
+    // photon-rs 0.3 `PhotonImage::get_bytes` encodes PNG.
+    // `native::image_to_bytes` is the raw RGBA buffer.
     Ok(resized.get_bytes())
 }
 
@@ -125,5 +127,21 @@ mod tests {
             super::resize_png(&[1, 2, 3], 8, 0).unwrap_err(),
             "resize dimension is zero"
         );
+    }
+
+    // 2×2 RGBA PNG (color type 6).
+    #[cfg(feature = "photon")]
+    const RGBA_2X2_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8,
+        6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 218, 99, 248, 207, 192,
+        240, 31, 12, 129, 52, 24, 0, 0, 73, 200, 9, 247, 3, 217, 100, 241, 0, 0, 0, 0, 73, 69, 78,
+        68, 174, 66, 96, 130,
+    ];
+
+    #[cfg(feature = "photon")]
+    #[test]
+    fn resize_png_returns_encoded_png() {
+        let png = super::resize_png(RGBA_2X2_PNG, 1, 1).unwrap();
+        assert!(png.starts_with(&[137, 80, 78, 71]));
     }
 }
