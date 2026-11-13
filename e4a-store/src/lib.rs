@@ -3,11 +3,16 @@
 //! Synchronous `Storage`. Semantic refusals come back on [`CommitResult`]; every other failure is [`Error`].
 
 mod engine;
+mod jsonl;
 mod memory;
 mod scan_page;
 mod sqlite;
 
 pub use e4a_types::*;
+pub use jsonl::{
+    append_line, is_reclaim_name, is_sidecar_name, parse_line, sidecar_name, JsonlError,
+    JsonlWriter, FORMAT_VERSION, MAIN_FILE, RECLAIM_SUFFIX,
+};
 pub use memory::MemoryStorage;
 pub use scan_page::page;
 pub use sqlite::SqliteStorage;
