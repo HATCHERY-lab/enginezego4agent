@@ -44,6 +44,7 @@ mod transcript;
 mod truncate;
 mod usage;
 mod view;
+mod view_sub;
 
 pub use advisor::advisor_tools;
 pub use broker::{broker, KeyBroker};
@@ -99,6 +100,7 @@ pub use transcript::{render, visible_lines, TranscriptLine};
 pub use truncate::truncate_chars;
 pub use usage::usage_doc;
 pub use view::window;
+pub use view_sub::on_lines;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
