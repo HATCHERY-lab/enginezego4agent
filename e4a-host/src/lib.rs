@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use e4a_harness::{TurnInput, TurnKind};
+use e4a_harness::{shutdown, ProviderSessions, TurnInput, TurnKind};
 use e4a_llm::{FauxLlm, Llm, OpenRouterClient, ToolSchema, Usage};
 use e4a_session::{EntryRecord, Session, SessionEnd, StoreKind, ROOT_CONVERSATION_ID};
 use e4a_tools::{run_until_answer, Workspace};
@@ -150,9 +150,10 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
             root,
             socks.as_deref().unwrap_or(""),
             key.as_deref().unwrap_or(""),
+            openrouter,
         ))
     } else {
-        runtime.block_on(faux_prompt(user_text, root))
+        runtime.block_on(faux_prompt(user_text, root, openrouter))
     };
     match answered {
         Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
@@ -190,14 +191,14 @@ fn prompt_text(params: Option<&Value>) -> Option<&str> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-async fn faux_prompt(user_text: &str, root: &str) -> Result<String, String> {
+async fn faux_prompt(user_text: &str, root: &str, openrouter: bool) -> Result<String, String> {
     let llm = FauxLlm::text(user_text).with_usage(Usage {
         input_tokens: 1,
         output_tokens: 1,
         provider: "faux".into(),
         model: "scripted".into(),
     });
-    memory_prompt(user_text, root, &llm).await
+    memory_prompt(user_text, root, &llm, openrouter).await
 }
 
 async fn openrouter_prompt(
@@ -205,13 +206,14 @@ async fn openrouter_prompt(
     root: &str,
     socks: &str,
     key: &str,
+    openrouter: bool,
 ) -> Result<String, String> {
     let from_env = std::env::var("E4A_MODEL").ok();
     let model = openrouter_model(from_env.as_deref());
     let llm = OpenRouterClient::new(model)
         .with_socks(socks)
         .with_key(key);
-    memory_prompt(user_text, root, &llm).await
+    memory_prompt(user_text, root, &llm, openrouter).await
 }
 
 /// `E4A_MODEL` when it is set and non-empty. Otherwise `openrouter/auto`.
@@ -222,21 +224,46 @@ fn openrouter_model(from_env: Option<&str>) -> String {
     }
 }
 
-async fn memory_prompt(user_text: &str, root: &str, llm: &impl Llm) -> Result<String, String> {
+async fn memory_prompt(
+    user_text: &str,
+    root: &str,
+    llm: &impl Llm,
+    openrouter: bool,
+) -> Result<String, String> {
     let session = open_journal(root).await?;
+    let provider = if openrouter { "openrouter" } else { "faux" };
+    let mut sessions = ProviderSessions::default();
+    if let Err(err) = sessions.remember("e4a", provider) {
+        let _ = close_journal(&session).await;
+        return Err(err);
+    }
     let answered = turn_text(&session, llm, user_text, root).await;
-    let closed = session
+    let released = shutdown(&mut sessions, "e4a");
+    // A missed release outranks the turn and the journal close. The turn outranks close.
+    let shutdown_err = if released == vec![provider.to_string()] {
+        None
+    } else {
+        Some("provider session was not released".to_string())
+    };
+    let closed = close_journal(&session).await;
+    if let Some(err) = shutdown_err {
+        return Err(err);
+    }
+    match (answered, closed) {
+        (Ok(text), Ok(())) => Ok(text),
+        (Ok(_), Err(err)) | (Err(err), _) => Err(err),
+    }
+}
+
+async fn close_journal(session: &Session) -> Result<(), String> {
+    session
         .close()
         .await
         .map_err(|err| err.to_string())
         .and_then(|end| match end {
             SessionEnd::Closed => Ok(()),
             SessionEnd::Failed { error } => Err(error),
-        });
-    match (answered, closed) {
-        (Ok(text), Ok(())) => Ok(text),
-        (Ok(_), Err(err)) | (Err(err), _) => Err(err),
-    }
+        })
 }
 
 /// Journal under `root`. Unset, empty, and `sqlite` open `e4a-session.sqlite`.
@@ -358,6 +385,24 @@ fn offered_tools() -> Vec<ToolSchema> {
                 "type":"object",
                 "properties":{"question":{"type":"string"}},
                 "required":["question"]
+            }),
+        ),
+        schema(
+            "advise",
+            "Ask the read-only advisor one question. It does not write or run commands.",
+            json!({
+                "type":"object",
+                "properties":{"question":{"type":"string"}},
+                "required":["question"]
+            }),
+        ),
+        schema(
+            "child",
+            "Run one command in the workspace jail for at most 30 seconds.",
+            json!({
+                "type":"object",
+                "properties":{"command":{"type":"string"}},
+                "required":["command"]
             }),
         ),
         schema(
