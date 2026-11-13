@@ -2,15 +2,18 @@
 
 //! Newline-delimited JSON-RPC on stdin and stdout.
 //!
-//! This process does not open a file store and it does not print a key.
-//! [`handle_line`] runs `session/prompt` through [`e4a_tools::run_until_answer`]
-//! on an in-memory session. The model is scripted unless both `E4A_SOCKS` and
-//! `E4A_OPENROUTER_KEY` are non-empty. That case dials OpenRouter. A dial or
-//! turn failure is JSON-RPC `-32603`, and the key is not copied into the message.
+//! The journal is the store named by `E4A_STORE`. Sqlite and JSONL sit under
+//! the workspace root. This process does not print a key.
+//! [`handle_line`] runs `session/prompt` through [`e4a_tools::run_until_answer`].
+//! The model is scripted unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are
+//! non-empty. That case dials OpenRouter. A dial or turn failure is JSON-RPC
+//! `-32603`, and the key is not copied into the message.
+
+use std::path::Path;
 
 use e4a_harness::{TurnInput, TurnKind};
 use e4a_llm::{FauxLlm, Llm, OpenRouterClient, ToolSchema, Usage};
-use e4a_session::{EntryRecord, Session, SessionEnd, ROOT_CONVERSATION_ID};
+use e4a_session::{EntryRecord, Session, SessionEnd, StoreKind, ROOT_CONVERSATION_ID};
 use e4a_tools::{run_until_answer, Workspace};
 use serde_json::{json, Value};
 
@@ -63,8 +66,8 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// A line that is not a JSON object with a string `method` returns [`Err`].
 /// Known methods return one JSON-RPC line ending in `\n`.
 ///
-/// `session/prompt` with one text block runs the tool loop on an in-memory
-/// session and returns `{stopReason:"end_turn", text}` when the model answers.
+/// `session/prompt` with one text block runs the tool loop on the `E4A_STORE`
+/// journal and returns `{stopReason:"end_turn", text}` when the model answers.
 /// The workspace root is `cwd`, or `sessionId` when `cwd` is absent.
 /// [`prompt_backend`] is `faux` unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY`
 /// are non-empty, in which case the turn dials OpenRouter. Missing prompt text,
@@ -220,7 +223,7 @@ fn openrouter_model(from_env: Option<&str>) -> String {
 }
 
 async fn memory_prompt(user_text: &str, root: &str, llm: &impl Llm) -> Result<String, String> {
-    let session = Session::memory().await.map_err(|err| err.to_string())?;
+    let session = open_journal(root).await?;
     let answered = turn_text(&session, llm, user_text, root).await;
     let closed = session
         .close()
@@ -234,6 +237,34 @@ async fn memory_prompt(user_text: &str, root: &str, llm: &impl Llm) -> Result<St
         (Ok(text), Ok(())) => Ok(text),
         (Ok(_), Err(err)) | (Err(err), _) => Err(err),
     }
+}
+
+/// Journal under `root`. Unset, empty, and `sqlite` open `e4a-session.sqlite`.
+/// `jsonl` opens `e4a-session-jsonl`. `idb` opens the name `e4a-session` and
+/// does not use `root`. Any other `E4A_STORE` is `unknown session store` and
+/// does not open a session.
+async fn open_journal(root: &str) -> Result<Session, String> {
+    let configured = match std::env::var("E4A_STORE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("unknown session store".to_string());
+        }
+    };
+    let root = Path::new(root);
+    let opened = match configured.as_str() {
+        "" | "sqlite" => {
+            let path = root.join("e4a-session.sqlite");
+            Session::open_kind(StoreKind::Sqlite, &path).await
+        }
+        "jsonl" => {
+            let path = root.join("e4a-session-jsonl");
+            Session::open_kind(StoreKind::Jsonl, &path).await
+        }
+        "idb" => Session::open_kind(StoreKind::Idb, Path::new("e4a-session")).await,
+        _ => return Err("unknown session store".to_string()),
+    };
+    opened.map_err(|err| err.to_string())
 }
 
 async fn turn_text(
@@ -273,7 +304,8 @@ fn redact_key(message: &str, key: &str) -> String {
     }
 }
 
-/// Same names and parameter objects as `e4a-tools` `examples/live.rs`.
+/// Filesystem and shell tools match `e4a-tools` `examples/live.rs`.
+/// `code` and `resize` are offered here as well.
 fn offered_tools() -> Vec<ToolSchema> {
     vec![
         schema(
@@ -337,6 +369,30 @@ fn offered_tools() -> Vec<ToolSchema> {
                     "command":{"type":"string"}
                 },
                 "required":["command"]
+            }),
+        ),
+        schema(
+            "code",
+            "Evaluate one script in the code-mode sandbox.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "script":{"type":"string"}
+                },
+                "required":["script"]
+            }),
+        ),
+        schema(
+            "resize",
+            "Resize a PNG in the workspace.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "w":{"type":"integer"},
+                    "h":{"type":"integer"}
+                },
+                "required":["path","w","h"]
             }),
         ),
     ]
