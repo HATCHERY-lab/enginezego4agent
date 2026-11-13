@@ -8,16 +8,17 @@ other review/automation loops.
 
 ## Origin and attribution
 
-e4a is a Rust port of **pi-durable 1.5.0**
-([`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/v1.5.0/packages/durable),
-tag `v1.5.0` = `f9a26365568127461c47a07a37dcb42c140a3ac5`) by Earendil Works —
+e4a is a Rust port of **pi-durable 1.5.2**
+([`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/v1.5.2/packages/durable),
+tag `v1.5.2` = `b4afdddf44e059c67ccf5097e5317d913521b470`) by Earendil Works —
 Mario Zechner and Armin Ronacher — released under the MIT License. We are
 grateful to its authors; the design (journal before display, checkpointed tasks,
 forks, usage ledger) is theirs. The upstream license text is kept in
 [`LICENSES/pi-MIT.txt`](LICENSES/pi-MIT.txt); see [`NOTICE`](NOTICE).
 
-This is a vendor fork: 1.5.0 is the fixed base, we maintain it ourselves and take
-ideas from upstream selectively.
+This is a vendor fork: 1.5.2 is the fixed base, we maintain it ourselves and take
+ideas from upstream selectively. The 1.5.0 E0 fixtures stay; durable had no
+breaking changes after 1.5.0.
 
 ## Where the code lives
 
