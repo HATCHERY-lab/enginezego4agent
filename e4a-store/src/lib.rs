@@ -4,12 +4,14 @@
 
 mod cloudflare;
 mod engine;
+mod indexeddb;
 mod memory;
 mod scan_page;
 mod sqlite;
 
 pub use cloudflare::sqlite_driver;
 pub use e4a_types::*;
+pub use indexeddb::{open, schema, MemoryIdb, ObjectIndex, ObjectStore, Schema};
 pub use memory::MemoryStorage;
 pub use scan_page::page;
 pub use sqlite::SqliteStorage;
