@@ -2,7 +2,7 @@
 //!
 //! The gate board is not read. A waiting `pi.generation` in the store is enough.
 
-use e4a_harness::{Generation, TurnOutcome};
+use e4a_harness::{Generation, TurnKind, TurnOutcome};
 use e4a_llm::Llm;
 use e4a_session::Session;
 use e4a_types::{TaskQuery, TaskStatus};
@@ -10,6 +10,7 @@ use e4a_types::{TaskQuery, TaskStatus};
 use crate::{run_waiting_gated, waiting_tool_id, Error, ToolOutcome, Workspace};
 
 const GENERATION_KIND: &str = "pi.generation";
+const ROUNDS: usize = 8;
 
 /// Run every waiting tool and release its generation.
 ///
@@ -43,7 +44,11 @@ pub async fn resume_waiting<L: Llm>(
     Ok(finished)
 }
 
-/// Finish waiting tools, then let each generation answer before a new prompt.
+/// Finish waiting tools, then keep going until each generation answers.
+///
+/// A model that asks for another tool is run, then asked again. The loop
+/// stops on an answer or a restart limit. A new user prompt is the caller's
+/// job and starts only after this returns.
 pub async fn resume_turns<L: Llm>(
     session: &Session,
     workspace: &Workspace,
@@ -63,9 +68,24 @@ pub async fn resume_turns<L: Llm>(
             .ok_or_else(|| {
                 Error::message(format!("task {} does not exist", tool.generation_task_id))
             })?;
-        let outcome = Generation::bind(tool.generation_task_id, task.conversation_id)
-            .resume(session, llm)
-            .await?;
+        let generation = Generation::bind(tool.generation_task_id, task.conversation_id);
+        let mut outcome = generation.resume(session, llm).await?;
+        let mut round = 0;
+        while matches!(outcome.kind, TurnKind::WaitingTool { .. }) {
+            round += 1;
+            if round > ROUNDS {
+                return Err(Error::message(
+                    "interrupted turn did not answer",
+                ));
+            }
+            let again = resume_waiting(session, workspace, llm).await?;
+            if again.is_empty() {
+                return Err(Error::message(
+                    "generation is waiting but no tool ran",
+                ));
+            }
+            outcome = generation.resume(session, llm).await?;
+        }
         turns.push(outcome);
     }
     Ok(turns)

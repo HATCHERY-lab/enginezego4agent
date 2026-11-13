@@ -4,9 +4,9 @@
 use std::fs;
 
 use e4a_harness::{Generation, TurnInput, TurnKind};
-use e4a_llm::{FauxLlm, ToolCall, ToolSchema, Usage};
+use e4a_llm::{FauxLlm, OpenRouterClient, ToolCall, ToolSchema, Usage};
 use e4a_session::{Session, TaskState, ROOT_CONVERSATION_ID};
-use e4a_tools::{resume_waiting, Workspace};
+use e4a_tools::{resume_turns, resume_waiting, Workspace};
 use e4a_types::TaskStatus;
 use serde_json::json;
 
@@ -139,6 +139,98 @@ async fn resume_finishes_advise_and_jev_from_the_model() {
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].content, "stop");
     assert!(!finished[0].content.contains("should we write"));
+    session.close().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn resume_turns_runs_the_next_tool_then_answers() {
+    let root = scratch();
+    let db = root.join("session.sqlite");
+    let session = Session::sqlite(&db).await.unwrap();
+    let workspace = Workspace::new(&root).unwrap();
+    let llm = FauxLlm::text("").with_tool_call(ToolCall {
+        id: "c1".into(),
+        name: "powershell".into(),
+        arguments: json!({"command": "Write-Output e4a-resume"}),
+    });
+    let parked = Generation::turn(&session, &llm, &powershell_input())
+        .await
+        .unwrap();
+    assert!(matches!(parked.kind, TurnKind::WaitingTool { .. }));
+    session.close().await.unwrap();
+
+    let session = Session::sqlite(&db).await.unwrap();
+    let llm = FauxLlm::text("")
+        .with_tool_call(ToolCall {
+            id: "c2".into(),
+            name: "powershell".into(),
+            arguments: json!({"command": "Write-Output e4a-again"}),
+        })
+        .then(FauxLlm::text("done"));
+    let turns = resume_turns(&session, &workspace, &llm).await.unwrap();
+    assert_eq!(turns.len(), 1);
+    assert!(matches!(turns[0].kind, TurnKind::Answered { .. }));
+    let generation = session.task(parked.task_id).await.unwrap().unwrap();
+    assert_eq!(generation.state.status(), TaskStatus::Terminal);
+    let view = session.watch(ROOT_CONVERSATION_ID).await.unwrap();
+    let blob = format!("{:?}", view.borrow().entries);
+    let results = view
+        .borrow()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "pi.toolResult")
+        .count();
+    assert_eq!(results, 2, "{blob}");
+    assert!(blob.contains("e4a-resume"), "{blob}");
+    assert!(blob.contains("e4a-again"), "{blob}");
+    assert!(blob.contains("done"), "{blob}");
+    let users = view
+        .borrow()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "pi.user")
+        .count();
+    assert_eq!(users, 1, "{blob}");
+    session.close().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn resume_turns_on_the_free_model_answers() {
+    let key = std::env::var("E4A_OPENROUTER_KEY").unwrap_or_default();
+    let socks = std::env::var("E4A_SOCKS").unwrap_or_default();
+    if key.is_empty() || socks.is_empty() {
+        eprintln!("skip live resume: socks or key unset");
+        return;
+    }
+    let root = scratch();
+    let db = root.join("session.sqlite");
+    let session = Session::sqlite(&db).await.unwrap();
+    let workspace = Workspace::new(&root).unwrap();
+    let llm = FauxLlm::text("").with_tool_call(ToolCall {
+        id: "c1".into(),
+        name: "powershell".into(),
+        arguments: json!({"command": "Write-Output e4a-live"}),
+    });
+    let parked = Generation::turn(&session, &llm, &powershell_input())
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+
+    let session = Session::sqlite(&db).await.unwrap();
+    let llm = OpenRouterClient::new("cohere/north-mini-code:free");
+    let turns = resume_turns(&session, &workspace, &llm).await.unwrap();
+    assert_eq!(turns.len(), 1, "free model did not finish the turn");
+    assert!(
+        matches!(turns[0].kind, TurnKind::Answered { .. }),
+        "free model left the turn {:?}",
+        turns[0].kind
+    );
+    let view = session.watch(ROOT_CONVERSATION_ID).await.unwrap();
+    let blob = format!("{:?}", view.borrow().entries);
+    assert!(blob.contains("e4a-live"), "{blob}");
+    let _ = parked.task_id;
     session.close().await.unwrap();
     let _ = fs::remove_dir_all(&root);
 }
