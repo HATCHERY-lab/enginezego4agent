@@ -2,11 +2,13 @@
 
 //! Synchronous `Storage`. Semantic refusals come back on [`CommitResult`]; every other failure is [`Error`].
 
+mod cloudflare;
 mod engine;
 mod memory;
 mod scan_page;
 mod sqlite;
 
+pub use cloudflare::sqlite_driver;
 pub use e4a_types::*;
 pub use memory::MemoryStorage;
 pub use scan_page::page;
