@@ -280,10 +280,8 @@ impl LocalEnv {
 impl ExecutionEnv for LocalEnv {
     fn read_file(&self, path: &Path, max_bytes: u64) -> Result<String, Error> {
         let resolved = self.resolve_existing(path)?;
-        let file = File::open(&resolved)
-            .map_err(|err| Error::message(format!("cannot read file: {err}")))?;
-        let meta = file
-            .metadata()
+        // Windows denies opening a directory, so classify it before `File::open`.
+        let meta = std::fs::metadata(&resolved)
             .map_err(|err| Error::message(format!("cannot read file: {err}")))?;
         if !meta.is_file() {
             return Err(Error::message("path is not a file"));
@@ -291,6 +289,8 @@ impl ExecutionEnv for LocalEnv {
         if meta.len() > max_bytes {
             return Err(too_large(max_bytes));
         }
+        let file = File::open(&resolved)
+            .map_err(|err| Error::message(format!("cannot read file: {err}")))?;
         let mut buf = Vec::new();
         file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut buf)
