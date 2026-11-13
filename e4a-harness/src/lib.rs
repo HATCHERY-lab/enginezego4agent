@@ -21,6 +21,7 @@ mod inbox;
 mod jev;
 mod json_merge;
 mod live_run;
+mod notify_pass;
 mod open_opts;
 mod overlay;
 mod partial;
@@ -78,6 +79,7 @@ pub use live_run::{
     remove_compaction_status, remove_nested_slots, tool_slot, tool_slot_mut, CompactionStatus,
     LiveRun, ToolSlot,
 };
+pub use notify_pass::{FinalizePass, PendingPass, RunnablePass};
 pub use open_opts::{
     normalize_open, AgentSettings, Effort, ModelRef, OpenOptions, ThinkingLevel,
     DEFAULT_RESTART_LIMIT,
