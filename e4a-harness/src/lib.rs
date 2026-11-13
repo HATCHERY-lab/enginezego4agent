@@ -1,6 +1,7 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
 mod compaction;
+mod compaction_job;
 mod context;
 mod define;
 mod errors;
@@ -27,6 +28,7 @@ mod usage;
 mod view;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
+pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
 pub use context::{order_tool_results, Message};
 pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use errors::error_chain;
