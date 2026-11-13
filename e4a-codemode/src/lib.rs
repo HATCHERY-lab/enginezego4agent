@@ -1,7 +1,10 @@
 // Portions derived from pi-durable 1.5.2 (packages/durable/src/codemode), MIT, © 2025 Mario Zechner / Earendil Works. See LICENSES/pi-MIT.txt.
 
 //! Code-mode tool protocol. Models, tool descriptions, and the text the tool
-//! shows the model are plain data. No JavaScript engine is linked.
+//! shows the model are plain data. QuickJS is optional (`quickjs`) and is not
+//! linked unless that feature is on.
+
+mod qjs;
 
 pub mod describe;
 pub mod models;
@@ -66,6 +69,13 @@ pub fn eval_unsupported(req: &SandboxRequest) -> SandboxReply {
     }
 }
 
+/// Evaluate JavaScript source through the feature-gated QuickJS path.
+///
+/// Without `quickjs` the runtime is not linked.
+pub fn eval(code: &str) -> Result<String, String> {
+    qjs::eval_source(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +98,17 @@ mod tests {
         });
         assert!(!reply.ok);
         assert_eq!(reply.text, "js runtime not linked");
+    }
+
+    #[cfg(not(feature = "quickjs"))]
+    #[test]
+    fn eval_reports_runtime_not_linked() {
+        assert_eq!(eval("").unwrap_err(), "js runtime not linked");
+        assert_eq!(eval("return 1").unwrap_err(), "js runtime not linked");
+        assert_eq!(
+            super::qjs::eval_source("'ok'").unwrap_err(),
+            "js runtime not linked"
+        );
     }
 
     #[test]
