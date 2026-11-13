@@ -1,5 +1,7 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
+mod advisor;
+mod broker;
 mod compaction;
 mod compaction_job;
 mod context;
@@ -21,6 +23,10 @@ mod run_state;
 mod scheduler;
 mod scheduler_js;
 mod search;
+mod sleep;
+mod slot;
+mod ssh_env;
+mod subagent;
 mod submissions;
 mod telemetry;
 mod timers;
@@ -34,6 +40,8 @@ mod truncate;
 mod usage;
 mod view;
 
+pub use advisor::advisor_tools;
+pub use broker::{broker, KeyBroker};
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
 pub use context::{order_tool_results, Message};
@@ -65,6 +73,10 @@ pub use run_state::{
 pub use scheduler::{Scheduler, Waiter};
 pub use scheduler_js::{migrate, note_crash, pick_ready, request_abort, Task};
 pub use search::find_line;
+pub use sleep::sleep_until;
+pub use slot::{ProviderSlot, E4A_SLOT};
+pub use ssh_env::{parse_target, SshTarget};
+pub use subagent::{spawn_child, Child};
 pub use submissions::{admit, withdraw_kind, Submission};
 pub use telemetry::TELEMETRY_SCHEMA;
 pub use timers::backoff_ms;
