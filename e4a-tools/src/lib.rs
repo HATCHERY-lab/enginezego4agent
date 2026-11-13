@@ -2,9 +2,11 @@
 //! [`run_waiting_tool`] does not call a model. [`run_until_answer`] drives the generation
 //! until it answers.
 
+mod coerce;
 mod shell;
 mod workspace;
 
+pub use coerce::coerce;
 pub use workspace::{ToolEffect, Workspace};
 
 use e4a_harness::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP};
