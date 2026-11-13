@@ -24,6 +24,37 @@ fn input(text: &str, tools: Vec<ToolSchema>) -> TurnInput {
 }
 
 #[tokio::test]
+async fn high_usage_writes_compaction_and_the_next_request_drops_the_old_text() {
+    let session = Session::memory().await.unwrap();
+    let llm = FauxLlm::text("OLD")
+        .with_usage(usage(200_000, 1))
+        .then(FauxLlm::text("SUM"));
+    let outcome = Generation::turn(&session, &llm, &input("remember OLD", Vec::new()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome.kind, TurnKind::Answered { .. }));
+    assert_eq!(llm.calls(), 2, "the compressor must be called");
+    let view = session.watch(ROOT_CONVERSATION_ID).await.unwrap();
+    assert!(
+        view.borrow()
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "pi.compaction"),
+        "journal missing pi.compaction"
+    );
+
+    let next = FauxLlm::text("ok");
+    Generation::turn(&session, &next, &input("second", Vec::new()))
+        .await
+        .unwrap();
+    let request = &next.requests()[0];
+    let blob = format!("{request:?}");
+    assert!(!blob.contains("remember OLD"), "{blob}");
+    assert!(blob.contains("SUM"), "{blob}");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn text_turn_publishes_assistant_and_usage() {
     let session = Session::memory().await.unwrap();
     let llm = FauxLlm::text("hello").with_usage(usage(11, 7));

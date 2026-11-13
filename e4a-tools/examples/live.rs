@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use e4a_harness::{TurnInput, TurnKind};
 use e4a_llm::{OpenRouterClient, ToolSchema};
-use e4a_session::{Session, ROOT_CONVERSATION_ID};
+use e4a_session::{Session, StoreKind, ROOT_CONVERSATION_ID};
 use e4a_tools::{run_until_answer, Workspace};
 use serde_json::json;
 
@@ -21,11 +21,12 @@ async fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| env::temp_dir().join("e4a-live"));
-    let _ = fs::remove_dir_all(&root);
+    if env::var("E4A_KEEP").ok().as_deref() != Some("1") {
+        let _ = fs::remove_dir_all(&root);
+    }
     fs::create_dir_all(&root).expect("sandbox");
     let workspace = Workspace::new(&root).expect("workspace");
-    let db = root.join("session.sqlite");
-    let session = Session::sqlite(&db).await.expect("sqlite session");
+    let session = open_session(&root).await;
     let model = env::var("E4A_MODEL").unwrap_or_else(|_| "cohere/north-mini-code:free".into());
     let llm = OpenRouterClient::new(model);
     let input = TurnInput {
@@ -97,6 +98,16 @@ async fn main() {
                     "required":["command"]
                 }),
             ),
+            schema(
+                "advise",
+                "Ask the read-only advisor one question. It does not write or run commands.",
+                json!({"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}),
+            ),
+            schema(
+                "child",
+                "Run one command in the workspace jail for at most 30 seconds.",
+                json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            ),
         ],
     };
     let outcome = run_until_answer(&session, &llm, &workspace, &input)
@@ -107,6 +118,21 @@ async fn main() {
         TurnKind::WaitingTool { .. } => println!("stop waiting"),
         TurnKind::RestartLimit => println!("stop limit"),
     }
+    println!("tail {}", outcome.tail.len());
+    if let Ok(view) = session.watch(ROOT_CONVERSATION_ID).await {
+        let kinds: Vec<_> = view
+            .borrow()
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect();
+        println!("kinds {}", kinds.join(","));
+    }
+    let outside = root.join("..").join("outside.txt");
+    println!(
+        "outside {}",
+        if outside.exists() { "EXISTS" } else { "absent" }
+    );
     for entry in fs::read_dir(&root).expect("list") {
         let entry = entry.expect("entry");
         let path = entry.path();
@@ -120,6 +146,20 @@ async fn main() {
         }
     }
     let _ = session.close().await;
+}
+
+async fn open_session(root: &std::path::Path) -> Session {
+    match env::var("E4A_STORE").ok().as_deref() {
+        Some("jsonl") => Session::open_kind(StoreKind::Jsonl, &root.join("e4a-session-jsonl"))
+            .await
+            .expect("jsonl session"),
+        Some("idb") => Session::open_kind(StoreKind::Idb, std::path::Path::new("e4a-live"))
+            .await
+            .expect("idb session"),
+        _ => Session::sqlite(&root.join("session.sqlite"))
+            .await
+            .expect("sqlite session"),
+    }
 }
 
 fn schema(name: &str, description: &str, parameters: serde_json::Value) -> ToolSchema {
