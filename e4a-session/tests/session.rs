@@ -110,13 +110,36 @@ async fn commit_appends_an_entry() {
 }
 
 #[tokio::test]
+async fn apply_ops_snapshot_contains_appended_text() {
+    let session = Session::memory().await.unwrap();
+    let op = e4a_session::append_entry(ROOT_CONVERSATION_ID, "user", "from-op").unwrap();
+    session
+        .commit(|tx| tx.apply_ops(&[op]))
+        .await
+        .unwrap();
+    let view = session.watch(ROOT_CONVERSATION_ID).await.unwrap();
+    let entry = view
+        .borrow()
+        .entries
+        .first()
+        .cloned()
+        .expect("appended entry");
+    assert_eq!(entry.kind, "pi.user");
+    assert_eq!(
+        entry.model,
+        Some(json!([{ "role": "user", "content": "from-op" }]))
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn document_set_via_op_set() {
     let session = Session::memory().await.unwrap();
     let def = note_doc();
     session
         .commit(|tx| {
             let doc = tx.doc(&def, Some(ROOT_CONVERSATION_ID))?;
-            tx.apply_ops(
+            tx.apply_doc_ops(
                 doc,
                 &[Op::Set(
                     vec![Seg::Key("text".into())],
@@ -216,7 +239,7 @@ async fn fork_at_entry_copies_as_of_not_tasks_and_mints_provider() {
     let (at, parent_provider, task_id) = session
         .commit(|tx| {
             let agent = tx.doc(&agent_doc(), Some(ROOT_CONVERSATION_ID))?;
-            tx.apply_ops(
+            tx.apply_doc_ops(
                 agent,
                 &[Op::Set(vec![Seg::Key("compaction".into())], fields.clone())],
             )?;
@@ -293,7 +316,7 @@ async fn compaction_settings_are_stored_not_run() {
     session
         .commit(|tx| {
             let agent = tx.doc(&agent_doc(), Some(ROOT_CONVERSATION_ID))?;
-            tx.apply_ops(
+            tx.apply_doc_ops(
                 agent,
                 &[Op::Set(
                     vec![Seg::Key("compaction".into())],

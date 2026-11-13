@@ -4,19 +4,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use e4a_types::{
-    apply, ConversationOwner, ConversationParent, ConversationRecord,
-    DocumentAddress, DocumentContent, DocumentCreate, DocumentPoint, DocumentRecord, DocumentScope,
-    EntryQuery, EntryRecord, Json, Op, ScanOrder, StorageWrite, SubmissionRecord, SubmissionStatus,
-    SubmissionType, TaskRecord, TaskState, ROOT_CONVERSATION_ID,
+    apply, ConversationOwner, ConversationParent, ConversationRecord, DocumentAddress,
+    DocumentContent, DocumentCreate, DocumentFork, DocumentHistory, DocumentPoint, DocumentRecord,
+    DocumentScope, EntryQuery, EntryRecord, JoinPolicy, Json, Op, ScanOrder, Seg, StorageWrite,
+    SubmissionRecord, SubmissionStatus, SubmissionType, TaskOutcome, TaskOutcomeError, TaskRecord,
+    TaskState, ROOT_CONVERSATION_ID,
 };
+use serde_json::json;
 
-use crate::docs::{address_id, agent_doc, provider_doc, DocDef, DocRef};
+use crate::docs::{address_id, agent_doc, provider_doc, Checkpoint, DocDef, DocRef};
 use crate::forks::{copy_write, prepare_fork_document_copies, ForkDocumentCopy};
 use crate::keys::{
     append_key, conversation_key, document_key, entry_key, incarnation_key, request_key, scope_key,
     submission_key, table_keys, task_key, ALL_KEYS,
 };
 use crate::store::StoreHandle;
+use crate::tx_ops::{apply_order, TxOp};
 use crate::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,7 +504,7 @@ impl Tx {
         }))
     }
 
-    pub fn apply_ops(&mut self, doc: DocRef, ops: &[Op]) -> Result<Json, Error> {
+    pub fn apply_doc_ops(&mut self, doc: DocRef, ops: &[Op]) -> Result<Json, Error> {
         self.assert_open()?;
         let entry = self
             .documents
@@ -518,6 +521,55 @@ impl Tx {
             entry.target = DocTarget::Created { record };
         }
         Ok(value)
+    }
+
+    /// Stage `ops` in slice order. The surrounding session commit still stores one batch.
+    pub fn apply_ops(&mut self, ops: &[TxOp]) -> Result<(), Error> {
+        self.assert_open()?;
+        for op in apply_order(ops) {
+            self.apply_tx_op(op)?;
+        }
+        Ok(())
+    }
+
+    fn apply_tx_op(&mut self, op: &TxOp) -> Result<(), Error> {
+        match op {
+            TxOp::AppendEntry {
+                conversation_id,
+                role,
+                text,
+            } => {
+                self.append_entry(*conversation_id, entry_draft(role, text)?)?;
+                Ok(())
+            }
+            TxOp::SetTaskState { task_id, state } => self.apply_task_state(*task_id, state),
+            TxOp::NoteUsage {
+                conversation_id,
+                input,
+                output,
+            } => self.add_usage(*conversation_id, *input, *output),
+        }
+    }
+
+    fn apply_task_state(&mut self, task_id: i64, state: &str) -> Result<(), Error> {
+        let mut record = self.current_task(task_id)?.ok_or_else(|| {
+            Error::message(format!("Task {task_id} does not exist"))
+        })?;
+        record.state = named_task_state(&record.state, state)?;
+        self.set_task(record)
+    }
+
+    fn add_usage(&mut self, conversation_id: i64, input: i64, output: i64) -> Result<(), Error> {
+        let doc = self.doc(&usage_doc(), Some(conversation_id))?;
+        let current = self.doc_value(doc)?.clone();
+        let next_input = add_count(usage_counter(&current, "input")?, input, "input")?;
+        let next_output = add_count(usage_counter(&current, "output")?, output, "output")?;
+        let ops = [
+            Op::Set(vec![Seg::Key("input".into())], Json::from(next_input)),
+            Op::Set(vec![Seg::Key("output".into())], Json::from(next_output)),
+        ];
+        self.apply_doc_ops(doc, &ops)?;
+        Ok(())
     }
 
     pub fn doc_value(&self, doc: DocRef) -> Result<&Json, Error> {
@@ -1073,4 +1125,116 @@ impl Adopted {
 
 pub(crate) fn empty_scope() -> TransactionScope {
     TransactionScope { task_id: None }
+}
+
+/// User and assistant lines match the drafts already stored through [`Tx::append_entry`].
+fn entry_draft(role: &str, text: &str) -> Result<EntryDraft, Error> {
+    let (kind, model) = match role {
+        "user" => ("pi.user", json!([{ "role": "user", "content": text }])),
+        "assistant" => (
+            "pi.assistant",
+            json!([{ "role": "assistant", "content": [{ "type": "text", "text": text }] }]),
+        ),
+        "system" => (
+            "pi.system",
+            json!([{ "role": "system", "content": text }]),
+        ),
+        "tool" => (
+            "pi.toolResult",
+            json!([{ "role": "tool", "content": text }]),
+        ),
+        _ => {
+            return Err(Error::message(format!(
+                "role must be user, assistant, tool, or system, got {role}"
+            )));
+        }
+    };
+    Ok(EntryDraft {
+        kind: kind.into(),
+        model: Some(model),
+        data: None,
+        head: None,
+        edits: None,
+    })
+}
+
+fn named_task_state(current: &TaskState, state: &str) -> Result<TaskState, Error> {
+    match state {
+        "idle" => Ok(TaskState::Pending {
+            checkpoint: open_checkpoint(current),
+        }),
+        "running" => Ok(TaskState::Running {
+            checkpoint: open_checkpoint(current),
+        }),
+        "waiting" => {
+            let (on, policy) = match current {
+                TaskState::Waiting { on, policy, .. } => (on.clone(), *policy),
+                _ => (Vec::new(), JoinPolicy::AllSettled),
+            };
+            Ok(TaskState::Waiting {
+                checkpoint: open_checkpoint(current),
+                on,
+                policy,
+            })
+        }
+        "done" => Ok(TaskState::Terminal {
+            outcome: TaskOutcome::Completed {
+                result: json!({}),
+            },
+        }),
+        "failed" => Ok(TaskState::Terminal {
+            outcome: TaskOutcome::Failed {
+                error: TaskOutcomeError {
+                    message: "failed".into(),
+                    detail: None,
+                },
+                result: None,
+            },
+        }),
+        _ => Err(Error::message(format!(
+            "task state must be idle, running, waiting, done, or failed, got {state}"
+        ))),
+    }
+}
+
+fn open_checkpoint(state: &TaskState) -> Json {
+    match state {
+        TaskState::Pending { checkpoint }
+        | TaskState::Running { checkpoint }
+        | TaskState::Waiting { checkpoint, .. }
+        | TaskState::Sleeping { checkpoint, .. } => checkpoint.clone(),
+        TaskState::Completing { .. } | TaskState::Terminal { .. } => json!({}),
+    }
+}
+
+/// Same `pi.usage` ledger the harness writes. Counts sit beside `models` and `tools`.
+fn usage_doc() -> DocDef {
+    DocDef::conversation(
+        "pi.usage",
+        1,
+        DocumentHistory::Latest,
+        DocumentFork::Initial,
+        || json!({ "models": {}, "tools": {} }),
+        Checkpoint::Always,
+    )
+}
+
+fn usage_counter(value: &Json, key: &str) -> Result<i64, Error> {
+    match value.get(key) {
+        None | Some(Json::Null) => Ok(0),
+        Some(found) => found.as_i64().ok_or_else(|| {
+            Error::message(format!("pi.usage {key} is not an integer"))
+        }),
+    }
+}
+
+fn add_count(current: i64, delta: i64, name: &str) -> Result<i64, Error> {
+    if delta < 0 {
+        return Err(Error::message(format!(
+            "usage count must be non-negative, got {name} {delta}"
+        )));
+    }
+    current
+        .checked_add(delta)
+        .ok_or_else(|| Error::message(format!("pi.usage {name} overflows")))
 }

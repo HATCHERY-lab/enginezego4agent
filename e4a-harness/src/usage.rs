@@ -36,7 +36,7 @@ pub fn record_usage(
         bucket,
     )];
     let validated = apply(&current, &ops).map_err(|err| Error::message(err.to_string()))?;
-    tx.apply_ops(doc, &ops)?;
+    tx.apply_doc_ops(doc, &ops)?;
     if tx.doc_value(doc)? != &validated {
         return Err(Error::message("usage apply diverged from the committed op"));
     }
