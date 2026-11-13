@@ -63,6 +63,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "e4a-host"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "e4a-llm"
 version = "0.1.0"
 dependencies = [
