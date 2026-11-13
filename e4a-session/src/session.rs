@@ -254,12 +254,20 @@ impl Session {
         &self,
         conversation_id: i64,
     ) -> Result<Vec<e4a_types::TaskRecord>, Error> {
-        let _line = self.inner.line.lock().await;
-        self.assert_usable()?;
         let query = TaskQuery {
             conversation_id: Some(conversation_id),
             ..TaskQuery::default()
         };
+        self.scan_tasks(query).await
+    }
+
+    /// Tasks matching `query`. This does not delete them.
+    pub async fn scan_tasks(
+        &self,
+        query: TaskQuery,
+    ) -> Result<Vec<e4a_types::TaskRecord>, Error> {
+        let _line = self.inner.line.lock().await;
+        self.assert_usable()?;
         self.inner.store.call(move |storage| {
             let page = storage
                 .scan_tasks(&query, usize::MAX, None)

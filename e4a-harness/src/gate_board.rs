@@ -24,12 +24,14 @@ pub fn park_turn(task_id: i64) -> Result<(), Error> {
 
 /// Signal the parked turn gate from outside the model call.
 ///
-/// Missing gate is `gate is not parked`. A poisoned board lock is an error.
-/// `cancel` must be `cancel` and the stored error must still be there.
+/// A missing gate is success. The process that parked it may already be gone.
+/// The journal is the source of truth. A poisoned board lock is an error.
+/// When a gate is present, `cancel` must be `cancel` and the stored error must
+/// still be there.
 pub fn signal_turn(task_id: i64) -> Result<(), Error> {
     let mut board = lock_board()?;
     let Some(mut gate) = board.remove(&task_id) else {
-        return Err(Error::message("gate is not parked"));
+        return Ok(());
     };
     gate.signal("done").map_err(Error::message)?;
     let phase = gate.cancel(task_id);
@@ -38,4 +40,14 @@ pub fn signal_turn(task_id: i64) -> Result<(), Error> {
         return Err(Error::message(format!("gate phase is {phase}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_turn;
+
+    #[test]
+    fn signal_without_a_park_is_ok() {
+        signal_turn(i64::MAX).unwrap();
+    }
 }

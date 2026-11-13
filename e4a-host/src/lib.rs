@@ -309,6 +309,9 @@ async fn turn_text(
     root: &str,
 ) -> Result<(String, Vec<String>), String> {
     let workspace = Workspace::new(root).map_err(|err| err.to_string())?;
+    e4a_tools::resume_waiting(session, &workspace)
+        .await
+        .map_err(|err| err.to_string())?;
     let input = TurnInput {
         conversation_id: ROOT_CONVERSATION_ID,
         user_text: user_text.to_string(),

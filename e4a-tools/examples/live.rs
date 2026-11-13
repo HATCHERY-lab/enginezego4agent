@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use e4a_harness::{TurnInput, TurnKind};
 use e4a_llm::{OpenRouterClient, ToolSchema};
 use e4a_session::{Session, StoreKind, ROOT_CONVERSATION_ID};
-use e4a_tools::{run_until_answer, Workspace};
+use e4a_tools::{resume_waiting, run_until_answer, Workspace};
 use serde_json::json;
 
 #[tokio::main(flavor = "current_thread")]
@@ -27,6 +27,9 @@ async fn main() {
     fs::create_dir_all(&root).expect("sandbox");
     let workspace = Workspace::new(&root).expect("workspace");
     let session = open_session(&root).await;
+    resume_waiting(&session, &workspace)
+        .await
+        .expect("resume waiting tools");
     let model = env::var("E4A_MODEL").unwrap_or_else(|_| "cohere/north-mini-code:free".into());
     let llm = OpenRouterClient::new(model);
     let input = TurnInput {

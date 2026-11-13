@@ -17,7 +17,10 @@ pub use image_guard::image_refusal;
 pub use jev_gate::run_jev_gate;
 pub use mutation_queue::{EmptyPath, Mutation, MutationKind, Queue};
 pub use photon::{plan, runtime, PhotonOp};
+pub use resume::resume_waiting;
 pub use workspace::{ToolEffect, Workspace};
+
+mod resume;
 
 use e4a_harness::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP};
 use e4a_llm::Llm;

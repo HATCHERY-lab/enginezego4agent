@@ -160,6 +160,15 @@ impl Generation {
         self.execute(session, llm).await
     }
 
+    /// Drop `Waiting` after the tool result is already committed.
+    ///
+    /// Does not call the model. The next [`Self::resume`] sees a request whose
+    /// cutoff is the tool result.
+    pub async fn release_finished_tool(&self, session: &Session) -> Result<(), Error> {
+        session.commit(|tx| release_after_tool(tx, self)).await?;
+        Ok(())
+    }
+
     /// Resume a committed generation.
     ///
     /// `request` with no assistant entry after `cutoff` records one failed attempt. Under the cap
