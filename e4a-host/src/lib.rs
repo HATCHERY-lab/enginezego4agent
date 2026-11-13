@@ -5,13 +5,13 @@
 //! The journal is the store named by `E4A_STORE`. Sqlite and JSONL sit under
 //! the workspace root. This process does not print a key.
 //! [`handle_line`] runs `session/prompt` through [`e4a_tools::run_until_answer`].
-//! The model is scripted unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are
-//! non-empty. That case dials OpenRouter. A dial or turn failure is JSON-RPC
-//! `-32603`, and the key is not copied into the message.
+//! The model is scripted unless both `E4A_SOCKS` and the openrouter key from
+//! `e4a_harness::resolve` are non-empty. That case dials OpenRouter. A dial or
+//! turn failure is JSON-RPC `-32603`, and the key is not copied into the message.
 
 use std::path::Path;
 
-use e4a_harness::{shutdown, ProviderSessions, TurnInput, TurnKind};
+use e4a_harness::{resolve, shutdown, ProviderSessions, TurnInput, TurnKind};
 use e4a_llm::{FauxLlm, Llm, OpenRouterClient, ToolSchema, Usage};
 use e4a_session::{EntryRecord, Session, SessionEnd, StoreKind, ROOT_CONVERSATION_ID};
 use e4a_tools::{run_until_answer, Workspace};
@@ -69,10 +69,10 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// `session/prompt` with one text block runs the tool loop on the `E4A_STORE`
 /// journal and returns `{stopReason:"end_turn", text}` when the model answers.
 /// The workspace root is `cwd`, or `sessionId` when `cwd` is absent.
-/// [`prompt_backend`] is `faux` unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY`
-/// are non-empty, in which case the turn dials OpenRouter. Missing prompt text,
-/// or a missing workspace root, is JSON-RPC `-32602`. A failure is JSON-RPC
-/// `-32603` and does not include the key.
+/// [`prompt_backend`] is `faux` unless both `E4A_SOCKS` and the key from
+/// `e4a_harness::resolve("openrouter")` are non-empty, in which case the turn
+/// dials OpenRouter. Missing prompt text, or a missing workspace root, is
+/// JSON-RPC `-32602`. A failure is JSON-RPC `-32603` and does not include the key.
 pub fn handle_line(line: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
@@ -132,7 +132,8 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
         return rpc_error(id, -32602, "cwd or sessionId must be a non-empty string");
     };
     let socks = std::env::var("E4A_SOCKS").ok();
-    let key = std::env::var("E4A_OPENROUTER_KEY").ok();
+    // Err means no key. The error is not copied into the reply.
+    let key = resolve("openrouter").ok();
     let openrouter = prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter";
     // Sync stdin loop: one current-thread runtime for this turn. IO and time
     // are on so OpenRouter can dial; faux does not use them. The key stays in
