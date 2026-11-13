@@ -138,6 +138,40 @@ impl LocalEnv {
         &self.root
     }
 
+    /// Create `rel` and any missing parents inside the root.
+    ///
+    /// Joined under the root with the same jail as other paths. An empty path
+    /// and `..` are refused. A directory that already exists is success.
+    pub fn mkdir(&self, rel: &Path) -> Result<(), Error> {
+        refuse_parent(rel)?;
+        let resolved = self.resolve_under(rel)?;
+        std::fs::create_dir_all(&resolved).map_err(|err| {
+            Error::message(format!("cannot create directory: {err}"))
+        })?;
+        let canonical = resolved.canonicalize().map_err(|err| {
+            Error::message(format!("cannot resolve path: {err}"))
+        })?;
+        self.ensure_inside(&canonical)
+    }
+
+    /// Rename a file inside the root.
+    ///
+    /// Both paths are resolved inside the root. A missing source or a directory
+    /// source returns the error from [`node_io::rename_ok`], and
+    /// [`std::fs::rename`] is not called.
+    pub fn rename(&self, from: &Path, to: &Path) -> Result<(), Error> {
+        refuse_parent(from)?;
+        refuse_parent(to)?;
+        let source = self.resolve_under(from)?;
+        let dest = self.resolve_under(to)?;
+        let kind = rename_source_kind(&source)?;
+        let from_text = from.to_string_lossy();
+        let to_text = to.to_string_lossy();
+        node_io::rename_ok(&from_text, &to_text, kind).map_err(Error::message)?;
+        std::fs::rename(&source, &dest)
+            .map_err(|err| Error::message(format!("cannot rename file: {err}")))
+    }
+
     fn locate(&self, path: &Path) -> Result<PathBuf, Error> {
         if path.as_os_str().is_empty() {
             return Err(Error::message("path is empty"));
@@ -164,22 +198,7 @@ impl LocalEnv {
     /// Canonicalize the longest existing prefix. The missing tail must be
     /// ordinary single components, so `..` cannot leave the root.
     fn resolve_create(&self, path: &Path) -> Result<PathBuf, Error> {
-        let joined = self.locate(path)?;
-        let (anchor, suffix) = existing_anchor(&joined)?;
-        self.ensure_inside(&anchor)?;
-        let mut full = anchor;
-        for name in suffix.into_iter().rev() {
-            if name == "." {
-                continue;
-            }
-            if !is_single_normal(&name) {
-                return Err(Error::message("path escapes the root"));
-            }
-            full.push(&name);
-            if !full.starts_with(&self.root) {
-                return Err(Error::message("path escapes the root"));
-            }
-        }
+        let full = self.resolve_under(path)?;
         match std::fs::symlink_metadata(&full) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let canon = full.canonicalize().map_err(|err| {
@@ -196,6 +215,31 @@ impl LocalEnv {
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(full),
             Err(err) => Err(Error::message(format!("cannot resolve path: {err}"))),
         }
+    }
+
+    /// Join `path` under the root. Empty paths and `..` are refused.
+    ///
+    /// The longest existing prefix is canonicalized and must stay inside the
+    /// root. A missing tail is only ordinary single components. The result may
+    /// be a file, a directory, or a path that does not exist yet.
+    fn resolve_under(&self, path: &Path) -> Result<PathBuf, Error> {
+        let joined = self.locate(path)?;
+        let (anchor, suffix) = existing_anchor(&joined)?;
+        self.ensure_inside(&anchor)?;
+        let mut full = anchor;
+        for name in suffix.into_iter().rev() {
+            if name == "." {
+                continue;
+            }
+            if !is_single_normal(&name) {
+                return Err(Error::message("path escapes the root"));
+            }
+            full.push(&name);
+            if !full.starts_with(&self.root) {
+                return Err(Error::message("path escapes the root"));
+            }
+        }
+        Ok(full)
     }
 
     fn ensure_inside(&self, path: &Path) -> Result<(), Error> {
@@ -386,11 +430,30 @@ fn existing_anchor(path: &Path) -> Result<(PathBuf, Vec<OsString>), Error> {
     }
 }
 
+fn refuse_parent(path: &Path) -> Result<(), Error> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(Error::message("path escapes the root"));
+    }
+    Ok(())
+}
+
 fn is_single_normal(name: &OsStr) -> bool {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(part)), None) if part == name => true,
         _ => false,
+    }
+}
+
+fn rename_source_kind(path: &Path) -> Result<node_io::FileKind, Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(node_io::FileKind::Dir),
+        Ok(_) => Ok(node_io::FileKind::File),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(node_io::FileKind::Missing),
+        Err(err) => Err(Error::message(format!("cannot resolve path: {err}"))),
     }
 }
 
