@@ -157,7 +157,10 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
         runtime.block_on(faux_prompt(user_text, root, openrouter))
     };
     match answered {
-        Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
+        Ok((text, tail)) => result(
+            id,
+            json!({"stopReason": "end_turn", "text": text, "tail": tail}),
+        ),
         Err(err) => {
             let message = if openrouter {
                 redact_key(&err, key.as_deref().unwrap_or(""))
@@ -192,7 +195,11 @@ fn prompt_text(params: Option<&Value>) -> Option<&str> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-async fn faux_prompt(user_text: &str, root: &str, openrouter: bool) -> Result<String, String> {
+async fn faux_prompt(
+    user_text: &str,
+    root: &str,
+    openrouter: bool,
+) -> Result<(String, Vec<String>), String> {
     let llm = FauxLlm::text(user_text).with_usage(Usage {
         input_tokens: 1,
         output_tokens: 1,
@@ -208,7 +215,7 @@ async fn openrouter_prompt(
     socks: &str,
     key: &str,
     openrouter: bool,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let from_env = std::env::var("E4A_MODEL").ok();
     let model = openrouter_model(from_env.as_deref());
     let llm = OpenRouterClient::new(model)
@@ -230,7 +237,7 @@ async fn memory_prompt(
     root: &str,
     llm: &impl Llm,
     openrouter: bool,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let session = open_journal(root).await?;
     let provider = if openrouter { "openrouter" } else { "faux" };
     let mut sessions = ProviderSessions::default();
@@ -300,7 +307,7 @@ async fn turn_text(
     llm: &impl Llm,
     user_text: &str,
     root: &str,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let workspace = Workspace::new(root).map_err(|err| err.to_string())?;
     let input = TurnInput {
         conversation_id: ROOT_CONVERSATION_ID,
@@ -318,7 +325,7 @@ async fn turn_text(
         .await
         .map_err(|err| err.to_string())?
         .ok_or_else(|| format!("assistant entry {entry_id} is missing"))?;
-    entry_text(&entry)
+    Ok((entry_text(&entry)?, outcome.tail))
 }
 
 /// Replace `key` with `[redacted]` when the message contains it.
@@ -591,6 +598,7 @@ mod tests {
         assert_eq!(value["result"]["stopReason"], json!("end_turn"));
         // FauxLlm::text replays the script it was given, which is the user text.
         assert_eq!(value["result"]["text"], json!("hi"));
+        assert!(value["result"]["tail"].is_array());
     }
 
     #[test]
