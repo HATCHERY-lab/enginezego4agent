@@ -13,6 +13,12 @@ e4a-session = { path = "../e4a-session" }
 e4a-types = { path = "../e4a-types" }
 serde_json = "1"
 thiserror = "1"
+# Optional: a normal check does not compile photon-rs (native image codecs).
+photon-rs = { version = "0.3", optional = true }
+
+[features]
+default = []
+photon = ["dep:photon-rs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
