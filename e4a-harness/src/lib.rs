@@ -1,11 +1,15 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
+mod define;
 mod generation;
+mod inbox;
 mod scheduler;
 mod tool_task;
 mod usage;
 
+pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
+pub use inbox::{has_queued_reset, prepare_boundary, withdraw, InboxItem, QueueMode};
 pub use scheduler::{Scheduler, Waiter};
 pub use tool_task::ToolPhase;
 pub use usage::usage_doc;
