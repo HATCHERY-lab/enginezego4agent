@@ -1,16 +1,30 @@
 // Portions derived from pi-durable 1.5.2 (packages/durable/src/env), MIT, © 2025 Mario Zechner / Earendil Works. See LICENSES/pi-MIT.txt.
 
 //! Local execution environment confined to one canonical root.
-//! [`LocalEnv::exec`] does not spawn a process.
+//! [`LocalEnv::exec`] runs `powershell` on Windows and `bash` elsewhere,
+//! with the working directory inside that root.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// How many missing path components a not-yet-created file may add.
 const MAX_MISSING_COMPONENTS: usize = 128;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const WAIT_SLICE: Duration = Duration::from_millis(15);
+/// After the child exits or is killed, readers need a moment to observe EOF.
+const DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Filesystem and command operations.
 ///
@@ -29,9 +43,17 @@ pub trait ExecutionEnv {
     /// followed. An unsupported file type is skipped.
     fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>, Error>;
 
-    /// Run `command` in `cwd`, bounded by `timeout`.
+    /// Run `command` with `cwd` as the working directory.
     ///
-    /// [`LocalEnv`] does not spawn. It returns an error instead.
+    /// [`LocalEnv`] uses `powershell` on Windows and `bash` elsewhere.
+    /// A zero `timeout` means 30 seconds. A longer one is capped at 120 seconds.
+    /// Names containing `KEY`, `TOKEN`, or `SECRET` are removed from the
+    /// environment, as are `E4A_OPENROUTER_KEY` and `OPENROUTER_API_KEY`.
+    /// `stdout` and `stderr` together are capped at 64 KiB.
+    ///
+    /// An empty command, a `cwd` outside the root, or a failure to start is an
+    /// error and does not return [`ExecOutput`]. A timeout kills the child and
+    /// is an error. A non-zero exit is [`Ok`] with that exit code.
     fn exec(&self, command: &str, cwd: &Path, timeout: Duration) -> Result<ExecOutput, Error>;
 }
 
@@ -56,7 +78,10 @@ pub enum FileKind {
     Symlink,
 }
 
-/// Finished command. This slice never builds one.
+/// Finished command.
+///
+/// `stdout` and `stderr` together are at most 64 KiB. A non-zero `exit_code`
+/// is a finished command, not an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecOutput {
     pub exit_code: i32,
@@ -174,6 +199,32 @@ impl LocalEnv {
             Err(Error::message("path escapes the root"))
         }
     }
+
+    /// Validate `command` and `cwd` before a process is created.
+    ///
+    /// An empty command returns here, before the path jail, so the check does
+    /// not spawn and does not touch the filesystem.
+    fn prepare_exec<'a>(
+        &self,
+        command: &'a str,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<PreparedExec<'a>, Error> {
+        if command.is_empty() {
+            return Err(Error::message("command is empty"));
+        }
+        let cwd = self.resolve_existing(cwd)?;
+        let meta = std::fs::metadata(&cwd)
+            .map_err(|err| Error::message(format!("cannot resolve path: {err}")))?;
+        if !meta.is_dir() {
+            return Err(Error::message("path is not a directory"));
+        }
+        Ok(PreparedExec {
+            command,
+            cwd,
+            timeout: clamp_timeout(timeout),
+        })
+    }
 }
 
 impl ExecutionEnv for LocalEnv {
@@ -279,8 +330,9 @@ impl ExecutionEnv for LocalEnv {
         Ok(listed)
     }
 
-    fn exec(&self, _command: &str, _cwd: &Path, _timeout: Duration) -> Result<ExecOutput, Error> {
-        Err(Error::message("exec is not available in this slice"))
+    fn exec(&self, command: &str, cwd: &Path, timeout: Duration) -> Result<ExecOutput, Error> {
+        let prepared = self.prepare_exec(command, cwd, timeout)?;
+        run_command(&prepared)
     }
 }
 
@@ -357,4 +409,327 @@ fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
         return 0;
     };
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+struct PreparedExec<'a> {
+    command: &'a str,
+    cwd: PathBuf,
+    timeout: Duration,
+}
+
+struct OutputBuf {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum Pipe {
+    Stdout,
+    Stderr,
+}
+
+enum Wait {
+    Done(ExitStatus),
+    TimedOut,
+    Failed(std::io::Error),
+}
+
+fn clamp_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        DEFAULT_TIMEOUT
+    } else if timeout > MAX_TIMEOUT {
+        MAX_TIMEOUT
+    } else {
+        timeout
+    }
+}
+
+fn run_command(prepared: &PreparedExec<'_>) -> Result<ExecOutput, Error> {
+    let mut cmd = Command::new(shell_program());
+    let _ = shell_args(&mut cmd, prepared.command)
+        .current_dir(&prepared.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    silence_window(&mut cmd);
+    scrub_env(&mut cmd);
+    let mut child = cmd.spawn().map_err(|err| {
+        Error::message(format!("cannot start {}: {err}", shell_program()))
+    })?;
+    collect(&mut child, prepared.timeout)
+}
+
+#[cfg(windows)]
+fn shell_program() -> &'static str {
+    "powershell"
+}
+
+#[cfg(not(windows))]
+fn shell_program() -> &'static str {
+    "bash"
+}
+
+#[cfg(windows)]
+fn shell_args<'a>(cmd: &'a mut Command, command: &str) -> &'a mut Command {
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+    ])
+}
+
+#[cfg(not(windows))]
+fn shell_args<'a>(cmd: &'a mut Command, command: &str) -> &'a mut Command {
+    cmd.args(["-c", command])
+}
+
+fn collect(child: &mut Child, timeout: Duration) -> Result<ExecOutput, Error> {
+    let deadline = Instant::now() + timeout;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        kill_child(child);
+        return Err(Error::message("command output was not captured"));
+    };
+    let shared = Arc::new(Mutex::new(OutputBuf {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }));
+    let stdout_thread = match spawn_drain(
+        "e4a-env-stdout",
+        stdout,
+        Pipe::Stdout,
+        Arc::clone(&shared),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            kill_child(child);
+            return Err(Error::message(format!("cannot capture output: {err}")));
+        }
+    };
+    let stderr_thread = match spawn_drain(
+        "e4a-env-stderr",
+        stderr,
+        Pipe::Stderr,
+        Arc::clone(&shared),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            kill_child(child);
+            detach_reader(stdout_thread);
+            return Err(Error::message(format!("cannot capture output: {err}")));
+        }
+    };
+    let waited = wait_for_exit(child, deadline);
+    finish_io(stdout_thread, stderr_thread);
+    match waited {
+        Wait::Done(status) => {
+            let (stdout, stderr) = snapshot(&shared);
+            exit_output(stdout, stderr, status)
+        }
+        Wait::TimedOut => Err(Error::message(format!(
+            "command timed out after {}ms",
+            timeout.as_millis()
+        ))),
+        Wait::Failed(err) => Err(Error::message(format!("cannot wait for command: {err}"))),
+    }
+}
+
+fn spawn_drain(
+    name: &str,
+    pipe: impl Read + Send + 'static,
+    pipe_id: Pipe,
+    shared: Arc<Mutex<OutputBuf>>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || drain(pipe, pipe_id, shared))
+}
+
+fn drain(mut pipe: impl Read, pipe_id: Pipe, shared: Arc<Mutex<OutputBuf>>) {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut guard = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        append_capped(&mut guard, pipe_id, &chunk[..read]);
+    }
+}
+
+fn append_capped(buf: &mut OutputBuf, pipe_id: Pipe, chunk: &[u8]) {
+    let total = buf.stdout.len() + buf.stderr.len();
+    if total >= MAX_OUTPUT_BYTES || chunk.is_empty() {
+        return;
+    }
+    let room = MAX_OUTPUT_BYTES - total;
+    let take = chunk.len().min(room);
+    let dest = match pipe_id {
+        Pipe::Stdout => &mut buf.stdout,
+        Pipe::Stderr => &mut buf.stderr,
+    };
+    dest.extend_from_slice(&chunk[..take]);
+}
+
+fn wait_for_exit(child: &mut Child, deadline: Instant) -> Wait {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Wait::Done(status),
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    kill_child(child);
+                    return Wait::TimedOut;
+                }
+                thread::sleep(WAIT_SLICE.min(deadline.saturating_duration_since(now)));
+            }
+            Err(err) => {
+                kill_child(child);
+                return Wait::Failed(err);
+            }
+        }
+    }
+}
+
+fn finish_io(stdout: JoinHandle<()>, stderr: JoinHandle<()>) {
+    let deadline = Instant::now() + DRAIN_GRACE;
+    if readers_finished(&stdout, &stderr, deadline) {
+        let _ = stdout.join();
+        let _ = stderr.join();
+    } else {
+        detach_reader(stdout);
+        detach_reader(stderr);
+    }
+}
+
+fn readers_finished(stdout: &JoinHandle<()>, stderr: &JoinHandle<()>, deadline: Instant) -> bool {
+    loop {
+        if stdout.is_finished() && stderr.is_finished() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn detach_reader(handle: JoinHandle<()>) {
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        std::mem::forget(handle);
+    }
+}
+
+fn snapshot(shared: &Mutex<OutputBuf>) -> (String, String) {
+    let guard = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    let stdout = bounded_text(&guard.stdout, MAX_OUTPUT_BYTES);
+    let room = MAX_OUTPUT_BYTES - stdout.len();
+    let stderr = bounded_text(&guard.stderr, room);
+    (stdout, stderr)
+}
+
+fn bounded_text(bytes: &[u8], room: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= room {
+        return text.into_owned();
+    }
+    let mut end = room;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+fn exit_output(stdout: String, stderr: String, status: ExitStatus) -> Result<ExecOutput, Error> {
+    match status.code() {
+        Some(exit_code) => Ok(ExecOutput {
+            exit_code,
+            stdout,
+            stderr,
+        }),
+        None => Err(Error::message("command exited without a status")),
+    }
+}
+
+fn kill_child(child: &mut Child) {
+    #[cfg(windows)]
+    kill_windows_tree(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn kill_windows_tree(pid: u32) {
+    let mut cmd = Command::new("taskkill");
+    let _ = cmd
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    silence_window(&mut cmd);
+    scrub_env(&mut cmd);
+    let _ = cmd.status();
+}
+
+fn silence_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+fn scrub_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if env_name_is_sensitive(&key) {
+            let _ = cmd.env_remove(key);
+        }
+    }
+}
+
+/// `E4A_OPENROUTER_KEY`, `OPENROUTER_API_KEY`, and any name containing
+/// `KEY`, `TOKEN`, or `SECRET`. Matching is ASCII case-insensitive.
+/// A non-Unicode name is removed because it cannot be checked.
+fn env_name_is_sensitive(name: &OsStr) -> bool {
+    let Some(text) = name.to_str() else {
+        return true;
+    };
+    if text.eq_ignore_ascii_case("E4A_OPENROUTER_KEY")
+        || text.eq_ignore_ascii_case("OPENROUTER_API_KEY")
+    {
+        return true;
+    }
+    let upper = text.to_ascii_uppercase();
+    upper.contains("KEY") || upper.contains("TOKEN") || upper.contains("SECRET")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::LocalEnv;
+
+    #[test]
+    fn empty_command_returns_err_without_spawning() {
+        let env = LocalEnv {
+            root: Path::new(".").into(),
+        };
+        let Err(err) = env.prepare_exec("", Path::new("."), Duration::ZERO) else {
+            panic!("empty command must fail");
+        };
+        assert_eq!(err.to_string(), "command is empty");
+    }
 }
