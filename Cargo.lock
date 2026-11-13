@@ -245,6 +245,7 @@ version = "0.1.0"
 dependencies = [
  "e4a-llm",
  "e4a-session",
+ "e4a-store",
  "e4a-types",
  "serde",
  "serde_json",
