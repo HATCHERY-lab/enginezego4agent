@@ -2,13 +2,14 @@
 
 //! Newline-delimited JSON-RPC on stdin and stdout.
 //!
-//! This process does not open a socket or a file store, and it does not print a key.
-//! [`handle_line`] runs `session/prompt` as one in-memory faux turn unless both
-//! `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty. That case returns
-//! JSON-RPC `-32000` and does not dial.
+//! This process does not open a file store and it does not print a key.
+//! [`handle_line`] runs `session/prompt` as one in-memory turn. The turn is
+//! scripted unless both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty.
+//! That case dials OpenRouter. A dial failure is JSON-RPC `-32603`, and the
+//! key is not copied into the message.
 
 use e4a_harness::{Generation, TurnInput, TurnKind};
-use e4a_llm::{FauxLlm, Usage};
+use e4a_llm::{FauxLlm, Llm, OpenRouterClient, Usage};
 use e4a_session::{EntryRecord, Session, SessionEnd, ROOT_CONVERSATION_ID};
 use serde_json::{json, Value};
 
@@ -61,10 +62,11 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// A line that is not a JSON object with a string `method` returns [`Err`].
 /// Known methods return one JSON-RPC line ending in `\n`.
 ///
-/// `session/prompt` with one text block runs one faux generation and returns
-/// `{stopReason:"end_turn", text}` when [`prompt_backend`] is `faux`.
-/// When both `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty, the reply is
-/// JSON-RPC `-32000` and nothing is dialed. Missing prompt text is JSON-RPC `-32602`.
+/// `session/prompt` with one text block runs one in-memory generation and returns
+/// `{stopReason:"end_turn", text}`. [`prompt_backend`] is `faux` unless both
+/// `E4A_SOCKS` and `E4A_OPENROUTER_KEY` are non-empty, in which case the turn
+/// dials OpenRouter. Missing prompt text is JSON-RPC `-32602`. A failure is
+/// JSON-RPC `-32603` and does not include the key.
 pub fn handle_line(line: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
@@ -109,18 +111,36 @@ fn session_prompt(id: Value, params: Option<&Value>) -> Value {
     };
     let socks = std::env::var("E4A_SOCKS").ok();
     let key = std::env::var("E4A_OPENROUTER_KEY").ok();
-    if prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter" {
-        // Dial is the next slice. The key stays in this frame and is not copied into the reply.
-        return rpc_error(id, -32000, "openrouter dial is the next slice");
-    }
-    // Sync stdin loop: one current-thread runtime for this turn, no process and no network.
-    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+    let openrouter = prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter";
+    // Sync stdin loop: one current-thread runtime for this turn. IO and time
+    // are on so OpenRouter can dial; faux does not use them. The key stays in
+    // this frame and is not copied into the reply.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(err) => return rpc_error(id, -32603, &err.to_string()),
     };
-    match runtime.block_on(faux_prompt(user_text)) {
+    let answered = if openrouter {
+        runtime.block_on(openrouter_prompt(
+            user_text,
+            socks.as_deref().unwrap_or(""),
+            key.as_deref().unwrap_or(""),
+        ))
+    } else {
+        runtime.block_on(faux_prompt(user_text))
+    };
+    match answered {
         Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
-        Err(err) => rpc_error(id, -32603, &err),
+        Err(err) => {
+            let message = if openrouter {
+                redact_key(&err, key.as_deref().unwrap_or(""))
+            } else {
+                err
+            };
+            rpc_error(id, -32603, &message)
+        }
     }
 }
 
@@ -148,8 +168,35 @@ fn prompt_text(params: Option<&Value>) -> Option<&str> {
 }
 
 async fn faux_prompt(user_text: &str) -> Result<String, String> {
+    let llm = FauxLlm::text(user_text).with_usage(Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        provider: "faux".into(),
+        model: "scripted".into(),
+    });
+    memory_prompt(user_text, &llm).await
+}
+
+async fn openrouter_prompt(user_text: &str, socks: &str, key: &str) -> Result<String, String> {
+    let from_env = std::env::var("E4A_MODEL").ok();
+    let model = openrouter_model(from_env.as_deref());
+    let llm = OpenRouterClient::new(model)
+        .with_socks(socks)
+        .with_key(key);
+    memory_prompt(user_text, &llm).await
+}
+
+/// `E4A_MODEL` when it is set and non-empty. Otherwise `openrouter/auto`.
+fn openrouter_model(from_env: Option<&str>) -> String {
+    match from_env {
+        Some(model) if !model.is_empty() => model.to_string(),
+        _ => "openrouter/auto".to_string(),
+    }
+}
+
+async fn memory_prompt(user_text: &str, llm: &impl Llm) -> Result<String, String> {
     let session = Session::memory().await.map_err(|err| err.to_string())?;
-    let answered = turn_text(&session, user_text).await;
+    let answered = turn_text(&session, llm, user_text).await;
     let closed = session
         .close()
         .await
@@ -164,23 +211,17 @@ async fn faux_prompt(user_text: &str) -> Result<String, String> {
     }
 }
 
-async fn turn_text(session: &Session, user_text: &str) -> Result<String, String> {
-    let llm = FauxLlm::text(user_text).with_usage(Usage {
-        input_tokens: 1,
-        output_tokens: 1,
-        provider: "faux".into(),
-        model: "scripted".into(),
-    });
+async fn turn_text(session: &Session, llm: &impl Llm, user_text: &str) -> Result<String, String> {
     let input = TurnInput {
         conversation_id: ROOT_CONVERSATION_ID,
         user_text: user_text.to_string(),
         tools: Vec::new(),
     };
-    let outcome = Generation::turn(session, &llm, &input)
+    let outcome = Generation::turn(session, llm, &input)
         .await
         .map_err(|err| err.to_string())?;
     let TurnKind::Answered { entry_id } = outcome.kind else {
-        return Err("faux turn did not answer".to_string());
+        return Err("turn did not answer".to_string());
     };
     let entry = session
         .entry(entry_id)
@@ -188,6 +229,17 @@ async fn turn_text(session: &Session, user_text: &str) -> Result<String, String>
         .map_err(|err| err.to_string())?
         .ok_or_else(|| format!("assistant entry {entry_id} is missing"))?;
     entry_text(&entry)
+}
+
+/// Replace `key` with `[redacted]` when the message contains it.
+///
+/// An empty key matches every string, so it is left unchanged. The key is not written anywhere else.
+fn redact_key(message: &str, key: &str) -> String {
+    if key.is_empty() || !message.contains(key) {
+        message.to_string()
+    } else {
+        message.replace(key, "[redacted]")
+    }
 }
 
 fn entry_text(entry: &EntryRecord) -> Result<String, String> {
@@ -288,6 +340,27 @@ mod tests {
             prompt_backend(Some("socks5h://127.0.0.1:1080"), Some("sk-test")),
             "openrouter"
         );
+    }
+
+    #[test]
+    fn openrouter_model_uses_env_or_auto() {
+        assert_eq!(openrouter_model(None), "openrouter/auto");
+        assert_eq!(openrouter_model(Some("")), "openrouter/auto");
+        assert_eq!(openrouter_model(Some("vendor/model")), "vendor/model");
+    }
+
+    #[test]
+    fn dial_error_replaces_the_key() {
+        assert_eq!(redact_key("dial failed", "sk-test"), "dial failed");
+        assert_eq!(
+            redact_key("authorization: sk-test", "sk-test"),
+            "authorization: [redacted]"
+        );
+        assert_eq!(
+            redact_key("sk-test and sk-test", "sk-test"),
+            "[redacted] and [redacted]"
+        );
+        assert_eq!(redact_key("keep", ""), "keep");
     }
 
     #[test]
