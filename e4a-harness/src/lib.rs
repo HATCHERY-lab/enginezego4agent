@@ -51,6 +51,7 @@ mod truncate;
 mod usage;
 mod view;
 mod view_sub;
+mod provider_close;
 
 pub use advisor::advisor_tools;
 pub use advisor_agent::{advisor_agent, advisor_fallback};
@@ -113,6 +114,7 @@ pub use truncate::truncate_chars;
 pub use usage::usage_doc;
 pub use view::window;
 pub use view_sub::on_lines;
+pub use provider_close::ProviderSessions;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
