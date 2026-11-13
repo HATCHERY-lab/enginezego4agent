@@ -2,8 +2,8 @@
 //!
 //! The gate board is not read. A waiting `pi.generation` in the store is enough.
 
-use e4a_harness::Generation;
-use e4a_llm::FauxLlm;
+use e4a_harness::{Generation, TurnOutcome};
+use e4a_llm::Llm;
 use e4a_session::Session;
 use e4a_types::{TaskQuery, TaskStatus};
 
@@ -13,11 +13,12 @@ const GENERATION_KIND: &str = "pi.generation";
 
 /// Run every waiting tool and release its generation.
 ///
-/// No model is called. A tool that needs one (`jev`, `advise`) returns that
-/// error and stops the scan. An empty result means nothing was waiting.
-pub async fn resume_waiting(
+/// `llm` is used only for `jev` and `advise`. Other tools do not call it.
+/// An empty result means nothing was waiting.
+pub async fn resume_waiting<L: Llm>(
     session: &Session,
     workspace: &Workspace,
+    llm: &L,
 ) -> Result<Vec<ToolOutcome>, Error> {
     let waiting = session
         .scan_tasks(TaskQuery {
@@ -33,12 +34,39 @@ pub async fn resume_waiting(
         if waiting_tool_id(task.id, &task.state).is_err() {
             continue;
         }
-        let outcome =
-            run_waiting_gated::<FauxLlm>(session, task.id, workspace, None).await?;
+        let outcome = run_waiting_gated(session, task.id, workspace, Some(llm)).await?;
         Generation::bind(task.id, task.conversation_id)
             .release_finished_tool(session)
             .await?;
         finished.push(outcome);
     }
     Ok(finished)
+}
+
+/// Finish waiting tools, then let each generation answer before a new prompt.
+pub async fn resume_turns<L: Llm>(
+    session: &Session,
+    workspace: &Workspace,
+    llm: &L,
+) -> Result<Vec<TurnOutcome>, Error> {
+    let finished = resume_waiting(session, workspace, llm).await?;
+    let mut turns = Vec::new();
+    let mut seen = Vec::new();
+    for tool in finished {
+        if seen.contains(&tool.generation_task_id) {
+            continue;
+        }
+        seen.push(tool.generation_task_id);
+        let task = session
+            .task(tool.generation_task_id)
+            .await?
+            .ok_or_else(|| {
+                Error::message(format!("task {} does not exist", tool.generation_task_id))
+            })?;
+        let outcome = Generation::bind(tool.generation_task_id, task.conversation_id)
+            .resume(session, llm)
+            .await?;
+        turns.push(outcome);
+    }
+    Ok(turns)
 }

@@ -309,7 +309,7 @@ async fn turn_text(
     root: &str,
 ) -> Result<(String, Vec<String>), String> {
     let workspace = Workspace::new(root).map_err(|err| err.to_string())?;
-    e4a_tools::resume_waiting(session, &workspace)
+    e4a_tools::resume_turns(session, &workspace, llm)
         .await
         .map_err(|err| err.to_string())?;
     let input = TurnInput {

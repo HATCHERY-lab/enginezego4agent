@@ -58,7 +58,8 @@ async fn resume_runs_the_waiting_powershell_and_the_next_request_sees_it() {
     session.close().await.unwrap();
 
     let session = Session::sqlite(&db).await.unwrap();
-    let finished = resume_waiting(&session, &workspace).await.unwrap();
+    let idle = FauxLlm::text("unused");
+    let finished = resume_waiting(&session, &workspace, &idle).await.unwrap();
     assert_eq!(finished.len(), 1);
     assert!(!finished[0].is_error);
     assert!(finished[0].content.contains("e4a-resume"), "{}", finished[0].content);
@@ -80,6 +81,83 @@ async fn resume_runs_the_waiting_powershell_and_the_next_request_sees_it() {
     let blob = format!("{:?}", next.requests()[0]);
     assert!(blob.contains("e4a-resume"), "{blob}");
     assert!(blob.contains("tool"), "{blob}");
+    let view = session.watch(ROOT_CONVERSATION_ID).await.unwrap();
+    let users = view
+        .borrow()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "pi.user")
+        .count();
+    assert_eq!(users, 1, "resume must not add a user turn");
+    let answered = view.borrow().entries.iter().any(|entry| {
+        entry.kind == "pi.assistant"
+            && entry
+                .model
+                .as_ref()
+                .and_then(|model| model.to_string().contains("saw").then_some(()))
+                .is_some()
+    });
+    assert!(answered, "assistant answer from the resumed generation is missing");
     session.close().await.unwrap();
     let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn resume_finishes_advise_and_jev_from_the_model() {
+    let root = scratch();
+    let db = root.join("session.sqlite");
+    let session = Session::sqlite(&db).await.unwrap();
+    let workspace = Workspace::new(&root).unwrap();
+    park_tool(
+        &session,
+        "advise",
+        json!({"question": "what is 2 plus 2?"}),
+    )
+    .await;
+    session.close().await.unwrap();
+
+    let session = Session::sqlite(&db).await.unwrap();
+    let advisor = FauxLlm::text("four");
+    let finished = resume_waiting(&session, &workspace, &advisor)
+        .await
+        .unwrap();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].content, "four");
+    session.close().await.unwrap();
+
+    let session = Session::sqlite(&db).await.unwrap();
+    park_tool(
+        &session,
+        "jev",
+        json!({"question": "should we write a file?"}),
+    )
+    .await;
+    session.close().await.unwrap();
+    let session = Session::sqlite(&db).await.unwrap();
+    let gate = FauxLlm::text("stop");
+    let finished = resume_waiting(&session, &workspace, &gate).await.unwrap();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].content, "stop");
+    assert!(!finished[0].content.contains("should we write"));
+    session.close().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+async fn park_tool(session: &Session, name: &str, arguments: serde_json::Value) {
+    let llm = FauxLlm::text("").with_tool_call(ToolCall {
+        id: "c1".into(),
+        name: name.into(),
+        arguments,
+    });
+    let input = TurnInput {
+        conversation_id: ROOT_CONVERSATION_ID,
+        user_text: "ask".into(),
+        tools: vec![ToolSchema {
+            name: name.into(),
+            description: "ask".into(),
+            parameters: json!({"type": "object"}),
+        }],
+    };
+    let parked = Generation::turn(session, &llm, &input).await.unwrap();
+    assert!(matches!(parked.kind, TurnKind::WaitingTool { .. }));
 }
