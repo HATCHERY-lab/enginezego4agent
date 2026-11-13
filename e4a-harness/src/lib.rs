@@ -20,6 +20,7 @@ mod provider;
 mod registry;
 mod run_state;
 mod scheduler;
+mod scheduler_drive;
 mod scheduler_js;
 mod search;
 mod signals;
@@ -66,6 +67,7 @@ pub use run_state::{
     BlockedSubject, Invocation, RegisteredDefinition, RunEvent, RunPhase,
 };
 pub use scheduler::{Scheduler, Waiter};
+pub use scheduler_drive::{on_abort, on_crash, step};
 pub use scheduler_js::{migrate, note_crash, pick_ready, request_abort, Task};
 pub use search::find_line;
 pub use signals::{cancel_waits, park, resume, signal, Signal};
