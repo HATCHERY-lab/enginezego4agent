@@ -10,6 +10,7 @@ mod provider;
 mod scheduler;
 mod submissions;
 mod tool_task;
+mod transcript;
 mod usage;
 
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
@@ -22,6 +23,7 @@ pub use provider::ensure_provider_session_id;
 pub use scheduler::{Scheduler, Waiter};
 pub use submissions::{admit, withdraw_kind, Submission};
 pub use tool_task::ToolPhase;
+pub use transcript::{render, visible_lines, TranscriptLine};
 pub use usage::usage_doc;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
