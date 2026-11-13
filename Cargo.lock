@@ -82,6 +82,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "e4a-tools"
+version = "0.1.0"
+dependencies = [
+ "e4a-harness",
+ "e4a-llm",
+ "e4a-session",
+ "e4a-types",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "e4a-types"
 version = "0.1.0"
 dependencies = [

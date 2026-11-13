@@ -1,5 +1,5 @@
 [workspace]
-members = ["e4a-types", "e4a-store", "e4a-session", "e4a-llm", "e4a-harness"]
+members = ["e4a-types", "e4a-store", "e4a-session", "e4a-llm", "e4a-harness", "e4a-tools"]
 resolver = "2"
 
 [workspace.package]
