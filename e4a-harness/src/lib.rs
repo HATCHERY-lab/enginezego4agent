@@ -54,7 +54,7 @@ pub use broker::{broker, KeyBroker};
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
 pub use compaction_run::compact_with;
-pub use compressor_agent::{compressor_agent, summary_max_tokens, AgentRole};
+pub use compressor_agent::{compressor_agent, summary_max_tokens};
 pub use context::{order_tool_results, Message};
 pub use context_bounds::{clamp_bounds, token_estimate, within, Bounds};
 pub use context_load::{load_lines, Line};

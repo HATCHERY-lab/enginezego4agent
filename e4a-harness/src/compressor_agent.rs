@@ -5,14 +5,7 @@
 //! A separate session from Pi compaction, on a cheaper model.
 //! Thinking text is not part of the summary. This role has no workspace tools.
 
-/// Static description of one agent role.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AgentRole {
-    pub id: &'static str,
-    pub model: &'static str,
-    pub tools: &'static [&'static str],
-    pub instructions: &'static str,
-}
+use crate::dev_agent::AgentRole;
 
 /// Cheap fast fallback. Not the free window.
 const COMPRESSOR_MODEL: &str = "minimax/minimax-m3.1-flash";
