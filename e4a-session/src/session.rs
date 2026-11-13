@@ -8,11 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use e4a_store::{IdbStorage, JsonlStorage, MemoryStorage, SqliteStorage, Storage};
 use e4a_types::{
     ConversationRecord, DocumentAddress, DocumentQuery, DocumentScope, EntryQuery, EntryRecord,
-    Json, ScanOrder, TaskQuery, ROOT_CONVERSATION_ID,
+    Json, Op, ScanOrder, TaskQuery, ROOT_CONVERSATION_ID,
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::docs::{address_id, DocDef};
+use crate::docs::{address_id, live_doc, DocDef};
+use crate::live_doc::live_document;
 use crate::keys::{conversation_key, document_key, entry_key, submission_key, task_key};
 use crate::store::StoreHandle;
 use crate::tx::{empty_scope, Adopted, AdoptedDocument, Tx};
@@ -147,6 +148,23 @@ impl Session {
         }
         self.assert_usable()?;
         Ok(value)
+    }
+
+    /// Commit `pi.live` for `conversation_id` on the existing document path.
+    pub async fn commit_live(
+        &self,
+        conversation_id: i64,
+        task_id: i64,
+        slots: &[(i64, String, bool)],
+        ended: Option<&str>,
+    ) -> Result<(), Error> {
+        let value = live_document(task_id, slots, ended);
+        self.commit(move |tx| {
+            let doc = tx.doc(&live_doc(), Some(conversation_id))?;
+            tx.apply_doc_ops(doc, &[Op::Replace(value)])?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn watch(
@@ -565,4 +583,30 @@ fn lock_std<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Error> 
     mutex
         .lock()
         .map_err(|_| Error::message("session state poisoned"))
+}
+
+#[cfg(test)]
+mod tests {
+    use e4a_types::ROOT_CONVERSATION_ID;
+
+    use super::Session;
+    use crate::docs::live_doc;
+
+    #[tokio::test]
+    async fn snapshot_reads_committed_live_doc() {
+        let session = Session::memory().await.unwrap();
+        let slots = [(10_i64, "read".to_owned(), false)];
+        session
+            .commit_live(ROOT_CONVERSATION_ID, 7, &slots, None)
+            .await
+            .unwrap();
+        let doc = session
+            .snapshot_doc(&live_doc(), Some(ROOT_CONVERSATION_ID))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.get("kind").and_then(|kind| kind.as_str()), Some("pi.live"));
+        assert_eq!(doc.get("taskId").and_then(|id| id.as_i64()), Some(7));
+        session.close().await.unwrap();
+    }
 }

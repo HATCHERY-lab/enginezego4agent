@@ -15,6 +15,7 @@ use crate::Error;
 
 pub const AGENT_KIND: &str = "pi.agent";
 pub const PROVIDER_KIND: &str = "pi.provider";
+pub const LIVE_KIND: &str = "pi.live";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocScopeKind {
@@ -203,6 +204,17 @@ pub fn provider_doc() -> DocDef {
         DocumentHistory::Latest,
         DocumentFork::Initial,
         || json!({ "sessionId": new_provider_session_id() }),
+        Checkpoint::Always,
+    )
+}
+
+pub fn live_doc() -> DocDef {
+    DocDef::conversation(
+        LIVE_KIND,
+        1,
+        DocumentHistory::Rewindable,
+        DocumentFork::AsOf,
+        || json!({}),
         Checkpoint::Always,
     )
 }

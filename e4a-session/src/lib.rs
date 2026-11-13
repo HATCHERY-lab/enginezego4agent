@@ -21,8 +21,8 @@ mod view;
 pub use backend::{describe, parse_kind, StoreKind};
 pub use cache::{admits, evict_oldest, Cache};
 pub use docs::{
-    agent_doc, compaction_fields, provider_doc, address_id, Checkpoint, CompactionSettings, DocDef,
-    DocRef, DocScopeKind, AGENT_KIND, PROVIDER_KIND,
+    agent_doc, compaction_fields, live_doc, provider_doc, address_id, Checkpoint, CompactionSettings,
+    DocDef, DocRef, DocScopeKind, AGENT_KIND, LIVE_KIND, PROVIDER_KIND,
 };
 pub use live::{
     cut_off_count, cut_off_too_often, salvageable, RunFailureReason, LIMIT_RESTARTS,
