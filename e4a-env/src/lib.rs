@@ -138,6 +138,19 @@ impl LocalEnv {
         &self.root
     }
 
+    /// Run `command` in the root for at most 30 seconds.
+    ///
+    /// An empty or whitespace-only command is refused and does not start a
+    /// process. Any other command uses [`ExecutionEnv::exec`] with this root,
+    /// so the working directory stays inside the jail and secret environment
+    /// names are removed.
+    pub fn start_child(&self, command: &str) -> Result<ExecOutput, Error> {
+        if command.trim().is_empty() {
+            return Err(Error::message("command is empty"));
+        }
+        self.exec(command, self.root(), Duration::from_secs(30))
+    }
+
     /// Create `rel` and any missing parents inside the root.
     ///
     /// Joined under the root with the same jail as other paths. An empty path
@@ -786,10 +799,37 @@ fn env_name_is_sensitive(name: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::time::Duration;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::LocalEnv;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "e4a-env-child-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap_or_else(|err| panic!("temp root: {err}"));
+            Self(path)
+        }
+
+        fn env(&self) -> LocalEnv {
+            LocalEnv::new(&self.0).unwrap_or_else(|err| panic!("{err}"))
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn empty_command_returns_err_without_spawning() {
@@ -800,5 +840,33 @@ mod tests {
             panic!("empty command must fail");
         };
         assert_eq!(err.to_string(), "command is empty");
+    }
+
+    #[test]
+    fn start_child_rejects_blank_command() {
+        let root = TempRoot::new();
+        let env = root.env();
+        for command in ["", " ", "\t", "\n", " \t\r\n "] {
+            let Err(err) = env.start_child(command) else {
+                panic!("blank command must fail");
+            };
+            assert_eq!(err.to_string(), "command is empty");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn start_child_writes_hi_on_windows() {
+        let root = TempRoot::new();
+        let env = root.env();
+        let output = env
+            .start_child("Write-Output hi")
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            output.stdout.contains("hi"),
+            "stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
     }
 }
