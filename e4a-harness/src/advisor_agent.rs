@@ -4,14 +4,7 @@
 //!
 //! The reviewer only reads. It is not extra tools on the developer.
 
-/// Identity, model, tools, and instructions for one agent session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AgentRole {
-    pub id: &'static str,
-    pub model: &'static str,
-    pub tools: &'static [&'static str],
-    pub instructions: &'static str,
-}
+use crate::dev_agent::AgentRole;
 
 const ADVISOR_INSTRUCTIONS: &str = "\
 You review the workspace. You do not write, edit, or run commands. \
@@ -29,7 +22,7 @@ pub fn advisor_agent() -> AgentRole {
 }
 
 /// Model used when the advisor model is unavailable.
-pub fn fallback_model() -> &'static str {
+pub fn advisor_fallback() -> &'static str {
     "minimax/minimax-m3.1-flash"
 }
 

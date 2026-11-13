@@ -21,6 +21,7 @@ mod inbox;
 mod json_merge;
 mod live_run;
 mod open_opts;
+mod overlay;
 mod partial;
 mod prompt;
 mod provider;
@@ -51,7 +52,7 @@ mod view;
 mod view_sub;
 
 pub use advisor::advisor_tools;
-pub use advisor_agent::{advisor_agent, fallback_model, AgentRole};
+pub use advisor_agent::{advisor_agent, advisor_fallback};
 pub use broker::{broker, KeyBroker};
 pub use compaction::{estimate_context, select_cut, serialize_conversation};
 pub use compaction_job::{should_compact, summary_entry, summary_instruction, Settings};
@@ -78,6 +79,7 @@ pub use open_opts::{
     normalize_open, AgentSettings, Effort, ModelRef, OpenOptions, ThinkingLevel,
     DEFAULT_RESTART_LIMIT,
 };
+pub use overlay::{after_tool, Overlay};
 pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;

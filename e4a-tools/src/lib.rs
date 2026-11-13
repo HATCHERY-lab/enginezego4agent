@@ -108,7 +108,15 @@ pub async fn run_waiting_tool(
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
     let pending = load_waiting(session, generation_task_id).await?;
-    let effect = workspace.call(&pending.name, &pending.arguments);
+    let effect = match e4a_harness::after_tool(&pending.name, &pending.arguments, 0) {
+        e4a_harness::Overlay::Stop { reason } => ToolEffect {
+            is_error: true,
+            content: reason.to_string(),
+        },
+        e4a_harness::Overlay::Continue | e4a_harness::Overlay::Compact => {
+            workspace.call(&pending.name, &pending.arguments)
+        }
+    };
     let entry_id = session
         .commit(|tx| commit_tool_result(tx, &pending, &effect))
         .await?;
