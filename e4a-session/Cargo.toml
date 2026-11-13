@@ -3,7 +3,7 @@ name = "e4a-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Durable session kernel for agent4agent"
+description = "Durable session kernel for engine4agent"
 publish = false
 
 [dependencies]

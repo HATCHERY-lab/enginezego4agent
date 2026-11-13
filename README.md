@@ -1,4 +1,4 @@
-# agent4agent (e4a)
+# engine4agent (e4a)
 
 Durable agent engine for Hatchery: give it an API key or an inference endpoint,
 get an agent with tools, sessions, forks, checkpointed tasks and cost accounting

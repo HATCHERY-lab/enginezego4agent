@@ -3,7 +3,7 @@ name = "e4a-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Filesystem tools for agent4agent"
+description = "Filesystem tools for engine4agent"
 publish = false
 
 [dependencies]

@@ -3,7 +3,7 @@ name = "e4a-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Durable Pi storage records for agent4agent"
+description = "Durable Pi storage records for engine4agent"
 publish = false
 
 [dependencies]

@@ -3,7 +3,7 @@ name = "e4a-harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Generation harness for agent4agent"
+description = "Generation harness for engine4agent"
 publish = false
 
 [dependencies]

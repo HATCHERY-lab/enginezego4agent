@@ -3,7 +3,7 @@ name = "e4a-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model turn streaming for agent4agent"
+description = "Model turn streaming for engine4agent"
 publish = false
 
 [dependencies]
