@@ -2,9 +2,12 @@
 
 //! Newline-delimited JSON-RPC on stdin and stdout.
 //!
-//! This process does not open a socket, read a key, or open a session store.
-//! [`handle_line`] does not call a model.
+//! This process does not open a socket, read a key, or open a file store.
+//! [`handle_line`] runs `session/prompt` as one in-memory faux turn.
 
+use e4a_harness::{Generation, TurnInput, TurnKind};
+use e4a_llm::{FauxLlm, Usage};
+use e4a_session::{EntryRecord, Session, SessionEnd, ROOT_CONVERSATION_ID};
 use serde_json::{json, Value};
 
 /// Subcommand of `e4a`. [`Command::Acp`] is the only subcommand besides help.
@@ -54,8 +57,10 @@ pub fn frame(method: &str, body: &Value) -> String {
 /// Handle one stdin line.
 ///
 /// A line that is not a JSON object with a string `method` returns [`Err`].
-/// Known methods return one JSON-RPC line ending in `\n`. `session/prompt`
-/// answers `{stopReason:"end_turn"}` and does not call a model.
+/// Known methods return one JSON-RPC line ending in `\n`.
+///
+/// `session/prompt` with one text block runs one faux generation and returns
+/// `{stopReason:"end_turn", text}`. Missing prompt text is JSON-RPC `-32602`.
 pub fn handle_line(line: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid JSON: {err}"))?;
     let obj = value
@@ -76,7 +81,7 @@ pub fn handle_line(line: &str) -> Result<String, String> {
             }),
         ),
         "session/new" => session_new(id, params),
-        "session/prompt" => result(id, json!({"stopReason": "end_turn"})),
+        "session/prompt" => session_prompt(id, params),
         _ => rpc_error(id, -32601, "Method not found"),
     };
     to_line(&reply)
@@ -92,6 +97,90 @@ fn session_new(id: Value, params: Option<&Value>) -> Value {
 fn cwd_param(params: Option<&Value>) -> Option<&str> {
     let cwd = params?.get("cwd")?.as_str()?;
     if cwd.is_empty() { None } else { Some(cwd) }
+}
+
+fn session_prompt(id: Value, params: Option<&Value>) -> Value {
+    let Some(user_text) = prompt_text(params) else {
+        return rpc_error(id, -32602, "prompt must be one non-empty text block");
+    };
+    // Sync stdin loop: one current-thread runtime for this turn, no process and no network.
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(err) => return rpc_error(id, -32603, &err.to_string()),
+    };
+    match runtime.block_on(faux_prompt(user_text)) {
+        Ok(text) => result(id, json!({"stopReason": "end_turn", "text": text})),
+        Err(err) => rpc_error(id, -32603, &err),
+    }
+}
+
+fn prompt_text(params: Option<&Value>) -> Option<&str> {
+    let blocks = params?.get("prompt")?.as_array()?;
+    let [block] = blocks.as_slice() else {
+        return None;
+    };
+    let block = block.as_object()?;
+    if block.get("type")?.as_str()? != "text" {
+        return None;
+    }
+    let text = block.get("text")?.as_str()?;
+    if text.is_empty() { None } else { Some(text) }
+}
+
+async fn faux_prompt(user_text: &str) -> Result<String, String> {
+    let session = Session::memory().await.map_err(|err| err.to_string())?;
+    let answered = turn_text(&session, user_text).await;
+    let closed = session
+        .close()
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|end| match end {
+            SessionEnd::Closed => Ok(()),
+            SessionEnd::Failed { error } => Err(error),
+        });
+    match (answered, closed) {
+        (Ok(text), Ok(())) => Ok(text),
+        (Ok(_), Err(err)) | (Err(err), _) => Err(err),
+    }
+}
+
+async fn turn_text(session: &Session, user_text: &str) -> Result<String, String> {
+    let llm = FauxLlm::text(user_text).with_usage(Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        provider: "faux".into(),
+        model: "scripted".into(),
+    });
+    let input = TurnInput {
+        conversation_id: ROOT_CONVERSATION_ID,
+        user_text: user_text.to_string(),
+        tools: Vec::new(),
+    };
+    let outcome = Generation::turn(session, &llm, &input)
+        .await
+        .map_err(|err| err.to_string())?;
+    let TurnKind::Answered { entry_id } = outcome.kind else {
+        return Err("faux turn did not answer".to_string());
+    };
+    let entry = session
+        .entry(entry_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("assistant entry {entry_id} is missing"))?;
+    entry_text(&entry)
+}
+
+fn entry_text(entry: &EntryRecord) -> Result<String, String> {
+    entry
+        .model
+        .as_ref()
+        .and_then(|model| model.get(0))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.get(0))
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "assistant entry has no text".to_string())
 }
 
 fn result(id: Value, value: Value) -> Value {
@@ -166,13 +255,31 @@ mod tests {
     }
 
     #[test]
-    fn prompt_ends_turn_without_calling_a_model() {
+    fn prompt_returns_scripted_text() {
         let line = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"/repo","prompt":[{"type":"text","text":"hi"}]}}"#,
         )
         .expect("prompt");
         let value = parse_reply(&line);
+        assert_eq!(value["id"], json!(3));
         assert_eq!(value["result"]["stopReason"], json!("end_turn"));
+        // FauxLlm::text replays the script it was given, which is the user text.
+        assert_eq!(value["result"]["text"], json!("hi"));
+    }
+
+    #[test]
+    fn prompt_rejects_missing_text() {
+        for line in [
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"/repo"}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":""}]}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt"}"#,
+        ] {
+            let reply = handle_line(line).expect("protocol error");
+            let value = parse_reply(&reply);
+            assert_eq!(value["error"]["code"], json!(-32602));
+        }
     }
 
     #[test]
