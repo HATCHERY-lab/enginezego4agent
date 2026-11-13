@@ -1,4 +1,5 @@
-//! Model turns. [`Llm`] yields text, tool-call, and usage events and does not speak HTTP.
+//! Model turns. [`Llm`] yields text, tool-call, and usage events.
+//! [`OpenRouterClient`] is the only caller that speaks HTTPS, and only after SOCKS5.
 
 mod faux;
 mod openrouter;
