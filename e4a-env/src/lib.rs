@@ -6,6 +6,9 @@
 
 pub mod node_io;
 pub mod watch;
+mod watch_thread;
+
+pub use watch_thread::WatchHub;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
