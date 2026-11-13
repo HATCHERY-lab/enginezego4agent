@@ -5,6 +5,7 @@
 mod coerce;
 mod edit_diff;
 mod image_guard;
+mod jev_gate;
 mod mutation_queue;
 mod photon;
 mod shell;
@@ -13,6 +14,7 @@ mod workspace;
 pub use coerce::coerce;
 pub use edit_diff::apply_hunks;
 pub use image_guard::image_refusal;
+pub use jev_gate::run_jev_gate;
 pub use mutation_queue::{EmptyPath, Mutation, MutationKind, Queue};
 pub use photon::{plan, runtime, PhotonOp};
 pub use workspace::{ToolEffect, Workspace};
@@ -87,7 +89,11 @@ pub async fn run_until_answer<L: Llm>(
         if iterations >= MODEL_CALL_CAP {
             break;
         }
-        run_waiting_tool(session, outcome.task_id, workspace).await?;
+        if std::env::var("E4A_JEV").ok().as_deref() == Some("1") {
+            run_waiting_gated(session, outcome.task_id, workspace, Some(llm)).await?;
+        } else {
+            run_waiting_tool(session, outcome.task_id, workspace).await?;
+        }
         outcome = Generation::bind(outcome.task_id, input.conversation_id)
             .continue_after_tool(session, llm)
             .await?;
@@ -107,12 +113,33 @@ pub async fn run_waiting_tool(
     generation_task_id: i64,
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
+    run_waiting_gated::<e4a_llm::FauxLlm>(session, generation_task_id, workspace, None).await
+}
+
+async fn run_waiting_gated<L: Llm>(
+    session: &Session,
+    generation_task_id: i64,
+    workspace: &Workspace,
+    llm: Option<&L>,
+) -> Result<ToolOutcome, Error> {
     let pending = load_waiting(session, generation_task_id).await?;
-    let decision = e4a_harness::decide(e4a_harness::JevSnap {
-        tool: &pending.name,
-        arguments: &pending.arguments,
-        transcript_chars: 0,
-    });
+    let decision = match llm {
+        Some(llm) => {
+            crate::jev_gate::run_jev_gate(
+                llm,
+                workspace,
+                &pending.name,
+                &pending.arguments,
+                0,
+            )
+            .await?
+        }
+        None => e4a_harness::decide(e4a_harness::JevSnap {
+            tool: &pending.name,
+            arguments: &pending.arguments,
+            transcript_chars: 0,
+        }),
+    };
     let effect = match decision {
         e4a_harness::JevDecision::Stop { reason } => ToolEffect {
             is_error: true,

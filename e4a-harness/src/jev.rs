@@ -4,7 +4,9 @@
 // a closed set: continue, stop, compact, steer. It does not write or run code.
 // Pi has steer, abort, and a compaction task, and no such proxy.
 
-use serde_json::Value;
+use serde_json::{json, Value};
+
+use e4a_llm::ToolSchema;
 
 use crate::overlay::{after_tool, Overlay};
 
@@ -55,6 +57,40 @@ pub fn parse(answer: &str) -> JevDecision {
         },
         "compact" => JevDecision::Compact,
         _ => JevDecision::Continue,
+    }
+}
+
+/// Tools the gate may call. Not the developer set.
+pub fn jev_tool_schemas() -> Vec<ToolSchema> {
+    vec![
+        tool(
+            "read",
+            "Read one UTF-8 file before you decide. One path only.",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
+        tool(
+            "stop",
+            "Stop the worker. The tool will not run.",
+            json!({"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"]}),
+        ),
+        tool(
+            "compact",
+            "Ask for a summary before the next worker step.",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "steer",
+            "Replace the worker step with a short instruction. The tool will not run.",
+            json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+        ),
+    ]
+}
+
+fn tool(name: &str, description: &str, parameters: Value) -> ToolSchema {
+    ToolSchema {
+        name: name.into(),
+        description: description.into(),
+        parameters,
     }
 }
 

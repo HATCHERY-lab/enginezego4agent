@@ -70,7 +70,7 @@ pub use generation_plan::{message_chars, plan, stop_reason, PlanStep};
 pub use graph::{children, roots, would_cycle, TaskNode};
 pub use harness_open::open_sqlite;
 pub use inbox::{has_queued_reset, prepare_boundary, withdraw, InboxItem, QueueMode};
-pub use jev::{decide, parse, parse_line, prompt, JevDecision, JevSnap};
+pub use jev::{decide, jev_tool_schemas, parse, parse_line, prompt, JevDecision, JevSnap};
 pub use json_merge::merge_object;
 pub use live_run::{
     add_compaction_status, clear_progress, end_run, fail_compaction_status, finish_slot,
