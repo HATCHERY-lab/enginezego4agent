@@ -3,20 +3,24 @@
 //! until it answers.
 
 mod advisor_loop;
+mod agent_spawn;
 mod coerce;
 mod edit_diff;
 mod image_guard;
 mod jev_gate;
+mod m4a;
 mod mutation_queue;
 mod photon;
 mod shell;
 mod workspace;
 
 pub use advisor_loop::{advisor_doc, review, AdvisoryNote};
+pub use agent_spawn::run_agent_child;
 pub use coerce::coerce;
 pub use edit_diff::apply_hunks;
 pub use image_guard::image_refusal;
 pub use jev_gate::run_jev_gate;
+pub use m4a::{inbox, send, whoami};
 pub use mutation_queue::{EmptyPath, Mutation, MutationKind, Queue};
 pub use photon::{plan, runtime, PhotonOp};
 pub use resume::{resume_turns, resume_waiting};
@@ -203,7 +207,40 @@ async fn run_waiting_gated(
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
     let pending = load_pending(session, generation_task_id, tool_task_id).await?;
-    let effect = if pending.name == "child" {
+    let effect = if pending.name == "agent" {
+        let prompt = pending
+            .arguments
+            .get("prompt")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        match crate::agent_spawn::run_agent_child(workspace, prompt).await {
+            Ok(answer) => ToolEffect {
+                is_error: false,
+                content: answer,
+            },
+            Err(error) => ToolEffect {
+                is_error: true,
+                content: error.to_string(),
+            },
+        }
+    } else if pending.name == "mail_send" {
+        let to = pending.arguments.get("to").and_then(Json::as_str).unwrap_or("");
+        let subject = pending
+            .arguments
+            .get("subject")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let body = pending.arguments.get("body").and_then(Json::as_str).unwrap_or("");
+        mail_effect(crate::m4a::send(to, subject, body)).await
+    } else if pending.name == "mail_inbox" {
+        let wait = pending
+            .arguments
+            .get("wait_secs")
+            .and_then(Json::as_u64);
+        mail_effect(crate::m4a::inbox(wait)).await
+    } else if pending.name == "mail_whoami" {
+        mail_effect(crate::m4a::whoami()).await
+    } else if pending.name == "child" {
         child_effect(
             generation_task_id,
             pending.tool_task_id,
@@ -249,6 +286,19 @@ async fn run_waiting_gated(
 /// An empty command does not spawn. `spawn_child` only records the child.
 /// [`e4a_env::LocalEnv::start_child`] is the process. A non-zero exit is an
 /// error result whose text is stderr. A zero exit is stdout.
+async fn mail_effect(call: impl std::future::Future<Output = Result<String, Error>>) -> ToolEffect {
+    match call.await {
+        Ok(text) => ToolEffect {
+            is_error: false,
+            content: text,
+        },
+        Err(error) => ToolEffect {
+            is_error: true,
+            content: error.to_string(),
+        },
+    }
+}
+
 fn child_effect(
     generation_task_id: i64,
     tool_task_id: i64,

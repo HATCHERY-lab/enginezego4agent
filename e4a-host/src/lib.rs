@@ -19,17 +19,19 @@ use e4a_session::{EntryRecord, Session, SessionEnd, StoreKind, ROOT_CONVERSATION
 use e4a_tools::{request_cancel_session, run_until_answer_in, Workspace};
 use serde_json::{json, Value};
 
-/// Subcommand of `e4a`. [`Command::Acp`] is the only subcommand besides help.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Subcommand of `e4a`: serve ACP, run one worker turn, or print help.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Serve ACP on stdin and stdout.
     Acp,
+    /// One worker turn in its own root; the answer goes to stdout.
+    Run { root: String, prompt: String },
     /// Print [`USAGE`] and exit successfully.
     Help,
 }
 
 /// Usage text for help, no arguments, and unknown arguments.
-pub const USAGE: &str = "usage: e4a acp\n";
+pub const USAGE: &str = "usage: e4a acp | e4a run --root <dir> --prompt <text>\n";
 
 /// Parse arguments after the program name.
 ///
@@ -40,18 +42,43 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut args = args.into_iter();
-    let Some(first) = args.next() else {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect();
+    let Some(first) = args.first() else {
         return Err(());
     };
-    if args.next().is_some() {
-        return Err(());
-    }
-    match first.as_ref() {
-        "acp" => Ok(Command::Acp),
-        "help" | "--help" | "-h" => Ok(Command::Help),
+    match first.as_str() {
+        "acp" if args.len() == 1 => Ok(Command::Acp),
+        "run" => parse_run(&args[1..]),
+        "help" | "--help" | "-h" if args.len() == 1 => Ok(Command::Help),
         _ => Err(()),
     }
+}
+
+/// `run --root <dir> --prompt <text>`, both flags required, in any order.
+fn parse_run(args: &[String]) -> Result<Command, ()> {
+    let mut root = None;
+    let mut prompt = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" => {
+                root = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--prompt" => {
+                prompt = args.get(index + 1).cloned();
+                index += 2;
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(Command::Run {
+        root: root.ok_or(())?,
+        prompt: prompt.ok_or(())?,
+    })
 }
 
 /// One JSON-RPC request line: `{"jsonrpc":"2.0","method":method,"params":body}` plus `\n`.
@@ -520,6 +547,43 @@ fn schema(name: &str, description: &str, parameters: Value) -> ToolSchema {
     }
 }
 
+/// One worker turn in its own root, for a spawned subagent process.
+///
+/// The workspace is `root` itself and the journal lives beside it. The model
+/// is the dev role's, resolved through `E4A_MODEL` / `E4A_DEV_MODEL`. The
+/// worker tool set is [`offered_tools`]: no `agent` — a worker does not spawn
+/// workers. The answer's text is the return value.
+pub async fn run_turn(root: &str, prompt: &str) -> Result<String, String> {
+    let session = open_journal(root).await?;
+    let workspace = e4a_tools::Workspace::new(root).map_err(|err| err.to_string())?;
+    let model = role_model(
+        std::env::var("E4A_MODEL").ok().as_deref(),
+        std::env::var("E4A_DEV_MODEL").ok().as_deref(),
+        e4a_harness::dev_agent().model,
+    );
+    let llm = e4a_llm::OpenRouterClient::new(model);
+    e4a_tools::resume_turns(&session, &workspace, &llm)
+        .await
+        .map_err(|err| err.to_string())?;
+    let input = e4a_harness::TurnInput {
+        conversation_id: e4a_session::ROOT_CONVERSATION_ID,
+        user_text: prompt.to_string(),
+        tools: offered_tools(),
+    };
+    let outcome = e4a_tools::run_until_answer_in(&session, &llm, &workspace, &input, root)
+        .await
+        .map_err(|err| err.to_string())?;
+    let e4a_harness::TurnKind::Answered { entry_id } = outcome.kind else {
+        return Err("subagent turn did not answer".to_string());
+    };
+    let entry = session
+        .entry(entry_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("assistant entry {entry_id} is missing"))?;
+    entry_text(&entry)
+}
+
 fn entry_text(entry: &EntryRecord) -> Result<String, String> {
     entry
         .model
@@ -959,6 +1023,28 @@ mod tests {
             let err = handle_line(line).expect_err("must not panic");
             assert!(!err.is_empty());
         }
+    }
+
+    #[test]
+    fn run_takes_root_and_prompt_in_any_order() {
+        assert_eq!(
+            parse_args(["run", "--root", "E:/dir", "--prompt", "do it"]),
+            Ok(Command::Run {
+                root: "E:/dir".into(),
+                prompt: "do it".into()
+            })
+        );
+        assert_eq!(
+            parse_args(["run", "--prompt", "do it", "--root", "E:/dir"]),
+            Ok(Command::Run {
+                root: "E:/dir".into(),
+                prompt: "do it".into()
+            })
+        );
+        assert!(parse_args(["run"]).is_err());
+        assert!(parse_args(["run", "--root", "E:/dir"]).is_err());
+        assert!(parse_args(["run", "--prompt", "x"]).is_err());
+        assert!(parse_args(["run", "--else", "x"]).is_err());
     }
 
     #[test]

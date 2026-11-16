@@ -14,6 +14,28 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(e4a_host::Command::Run { root, prompt }) => {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::from(1);
+                }
+            };
+            match runtime.block_on(e4a_host::run_turn(&root, &prompt)) {
+                Ok(answer) => {
+                    println!("{answer}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         Err(()) => {
             eprint!("{}", e4a_host::USAGE);
             ExitCode::from(2)
