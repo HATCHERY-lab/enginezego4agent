@@ -2,6 +2,7 @@
 //! [`run_waiting_tool`] does not call a model. [`run_until_answer`] drives the generation
 //! until it answers.
 
+mod advisor_loop;
 mod coerce;
 mod edit_diff;
 mod image_guard;
@@ -11,6 +12,7 @@ mod photon;
 mod shell;
 mod workspace;
 
+pub use advisor_loop::{advisor_doc, review, AdvisoryNote};
 pub use coerce::coerce;
 pub use edit_diff::apply_hunks;
 pub use image_guard::image_refusal;
