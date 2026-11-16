@@ -16,8 +16,12 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8741";
 const CALL_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// `to`, `subject`, `body` — one message to an account, a session, or a room.
-pub async fn send(to: &str, subject: &str, body: &str) -> Result<String, Error> {
-    let params = json!({ "to": to, "subject": subject, "body": body });
+/// `reply_to` threads it onto a message.
+pub async fn send(to: &str, subject: &str, body: &str, reply_to: Option<&str>) -> Result<String, Error> {
+    let mut params = json!({ "to": to, "subject": subject, "body": body });
+    if let Some(reply_to) = reply_to {
+        params["reply_to"] = json!(reply_to);
+    }
     call("mail_send", &params).await
 }
 
@@ -31,9 +35,35 @@ pub async fn inbox(wait_secs: Option<u64>) -> Result<String, Error> {
     call("mail_inbox", &params).await
 }
 
+/// Acknowledge messages so they leave the unread set.
+pub async fn ack(ids: &[i64]) -> Result<String, Error> {
+    call("mail_ack", &json!({ "ids": ids })).await
+}
+
+/// One message by id.
+pub async fn get(id: i64) -> Result<String, Error> {
+    call("mail_get", &json!({ "id": id })).await
+}
+
+/// The unread set, unacked.
+pub async fn unread() -> Result<String, Error> {
+    call("mail_unread", &json!({})).await
+}
+
 /// The caller's own address and card.
 pub async fn whoami() -> Result<String, Error> {
     call("mail_whoami", &json!({})).await
+}
+
+/// Say what this session is working on; the one declared fact a session may
+/// write about itself.
+pub async fn status(working_on: &str, role: &str) -> Result<String, Error> {
+    call("mail_status", &json!({ "working_on": working_on, "role": role })).await
+}
+
+/// Who else is in the mailbox: accounts, their live sessions, and rooms.
+pub async fn directory() -> Result<String, Error> {
+    call("mail_directory", &json!({})).await
 }
 
 /// One `POST /<route>` round trip with the bearer token. The answer body is

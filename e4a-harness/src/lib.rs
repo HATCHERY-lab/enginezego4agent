@@ -75,7 +75,7 @@ pub use context_bounds::{clamp_bounds, token_estimate, within, Bounds};
 pub use context_load::{load_lines, Line};
 pub use define::{define_extension, define_tool, ExtensionDef, ToolDef};
 pub use dev_agent::{dev_agent, fallback_model, AgentRole};
-pub use manager_agent::manager_agent;
+pub use manager_agent::{hatchery_admin_agent, manager_agent};
 pub use errors::error_chain;
 pub use generation::{Generation, TurnInput, TurnKind, TurnOutcome, MODEL_CALL_CAP, RESTART_CAP};
 pub use generation_plan::{message_chars, plan, stop_reason, PlanStep};

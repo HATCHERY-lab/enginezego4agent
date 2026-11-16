@@ -5,6 +5,7 @@
 mod advisor_loop;
 mod agent_spawn;
 mod coerce;
+mod hatchery_door;
 mod edit_diff;
 mod image_guard;
 mod jev_gate;
@@ -16,11 +17,12 @@ mod workspace;
 
 pub use advisor_loop::{advisor_doc, review, AdvisoryNote};
 pub use agent_spawn::run_agent_child;
+pub use hatchery_door::{task_update, tasks};
 pub use coerce::coerce;
 pub use edit_diff::apply_hunks;
 pub use image_guard::image_refusal;
 pub use jev_gate::run_jev_gate;
-pub use m4a::{inbox, send, whoami};
+pub use m4a::{ack, directory, get, inbox, send, status, unread, whoami};
 pub use mutation_queue::{EmptyPath, Mutation, MutationKind, Queue};
 pub use photon::{plan, runtime, PhotonOp};
 pub use resume::{resume_turns, resume_waiting};
@@ -231,7 +233,11 @@ async fn run_waiting_gated(
             .and_then(Json::as_str)
             .unwrap_or("");
         let body = pending.arguments.get("body").and_then(Json::as_str).unwrap_or("");
-        mail_effect(crate::m4a::send(to, subject, body)).await
+        let reply_to = pending
+            .arguments
+            .get("reply_to")
+            .and_then(Json::as_str);
+        mail_effect(crate::m4a::send(to, subject, body, reply_to)).await
     } else if pending.name == "mail_inbox" {
         let wait = pending
             .arguments
@@ -240,6 +246,16 @@ async fn run_waiting_gated(
         mail_effect(crate::m4a::inbox(wait)).await
     } else if pending.name == "mail_whoami" {
         mail_effect(crate::m4a::whoami()).await
+    } else if pending.name == "g4a_tasks" {
+        mail_effect(crate::hatchery_door::tasks()).await
+    } else if pending.name == "g4a_task_update" {
+        let id = pending.arguments.get("id").and_then(Json::as_i64).unwrap_or(0);
+        let status = pending
+            .arguments
+            .get("status")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        mail_effect(crate::hatchery_door::task_update(id, status)).await
     } else if pending.name == "child" {
         child_effect(
             generation_task_id,

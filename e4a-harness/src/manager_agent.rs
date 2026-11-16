@@ -38,6 +38,33 @@ pub fn manager_agent() -> AgentRole {
     }
 }
 
+/// Hatchery admin role: the manager set plus the node's door tools — open
+/// tasks of this machine and their state. The door exists only when the node
+/// gave the session `HATCHERY_NODE_DOOR`; the node signs every call.
+pub fn hatchery_admin_agent() -> AgentRole {
+    AgentRole {
+        id: "hatchery-admin",
+        model: "cohere/north-mini-code:free",
+        tools: &[
+            "read",
+            "write",
+            "edit",
+            "edit_all",
+            "powershell",
+            "child",
+            "agent",
+            "mail_send",
+            "mail_inbox",
+            "mail_whoami",
+            "g4a_tasks",
+            "g4a_task_update",
+        ],
+        instructions: HATCHERY_ADMIN_INSTRUCTIONS,
+    }
+}
+
+const HATCHERY_ADMIN_INSTRUCTIONS: &str = "You are the hatchery administrator. You know the system: mail is m4a, the board is g4a tasks through the node door, sessions run on nodes, the hub holds the cards. Read your tasks with g4a_tasks, work them, set them done with g4a_task_update, and report by mail. Spawn worker agents for the hands-on work. Never touch a key or a token: the node signs for you.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
