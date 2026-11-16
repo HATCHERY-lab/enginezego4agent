@@ -58,8 +58,7 @@ async fn resume_runs_the_waiting_powershell_and_the_next_request_sees_it() {
     session.close().await.unwrap();
 
     let session = Session::sqlite(&db).await.unwrap();
-    let idle = FauxLlm::text("unused");
-    let finished = resume_waiting(&session, &workspace, &idle).await.unwrap();
+    let finished = resume_waiting(&session, &workspace).await.unwrap();
     assert_eq!(finished.len(), 1);
     assert!(!finished[0].is_error);
     assert!(finished[0].content.contains("e4a-resume"), "{}", finished[0].content);
@@ -103,7 +102,7 @@ async fn resume_runs_the_waiting_powershell_and_the_next_request_sees_it() {
 }
 
 #[tokio::test]
-async fn resume_finishes_advise_and_jev_from_the_model() {
+async fn resume_refuses_legacy_jev_and_advise_tools() {
     let root = scratch();
     let db = root.join("session.sqlite");
     let session = Session::sqlite(&db).await.unwrap();
@@ -117,15 +116,15 @@ async fn resume_finishes_advise_and_jev_from_the_model() {
     session.close().await.unwrap();
 
     let session = Session::sqlite(&db).await.unwrap();
-    let advisor = FauxLlm::text("four");
-    let finished = resume_waiting(&session, &workspace, &advisor)
-        .await
-        .unwrap();
+    let finished = resume_waiting(&session, &workspace).await.unwrap();
     assert_eq!(finished.len(), 1);
-    assert_eq!(finished[0].content, "four");
+    assert!(finished[0].is_error, "advise is not a worker tool");
     session.close().await.unwrap();
 
+    let root = scratch();
+    let db = root.join("session.sqlite");
     let session = Session::sqlite(&db).await.unwrap();
+    let workspace = Workspace::new(&root).unwrap();
     park_tool(
         &session,
         "jev",
@@ -134,11 +133,9 @@ async fn resume_finishes_advise_and_jev_from_the_model() {
     .await;
     session.close().await.unwrap();
     let session = Session::sqlite(&db).await.unwrap();
-    let gate = FauxLlm::text("stop");
-    let finished = resume_waiting(&session, &workspace, &gate).await.unwrap();
+    let finished = resume_waiting(&session, &workspace).await.unwrap();
     assert_eq!(finished.len(), 1);
-    assert_eq!(finished[0].content, "stop");
-    assert!(!finished[0].content.contains("should we write"));
+    assert!(finished[0].is_error, "jev is not a worker tool");
     session.close().await.unwrap();
     let _ = fs::remove_dir_all(&root);
 }

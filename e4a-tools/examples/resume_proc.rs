@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use e4a_harness::{Generation, TurnInput, TurnKind};
-use e4a_llm::{FauxLlm, OpenRouterClient, ToolCall, ToolSchema};
+use e4a_llm::{FauxLlm, ToolCall, ToolSchema};
 use e4a_session::{Session, ROOT_CONVERSATION_ID};
 use e4a_tools::{resume_waiting, Workspace};
 use serde_json::json;
@@ -61,17 +61,8 @@ async fn main() {
             assert!(matches!(outcome.kind, TurnKind::WaitingTool { .. }));
             println!("parked {}", outcome.task_id);
         }
-        "resume-model" => {
-            let model = env::var("E4A_MODEL").unwrap_or_else(|_| "cohere/north-mini-code:free".into());
-            let llm = OpenRouterClient::new(model);
-            let finished = resume_waiting(&session, &workspace, &llm)
-                .await
-                .expect("resume");
-            assert_eq!(finished.len(), 1);
-            println!("resumed {}", finished[0].content.trim());
-        }
         "resume" => {
-            let finished = resume_waiting(&session, &workspace, &FauxLlm::text("unused"))
+            let finished = resume_waiting(&session, &workspace)
                 .await
                 .expect("resume");
             assert_eq!(finished.len(), 1);

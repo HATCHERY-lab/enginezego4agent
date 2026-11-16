@@ -453,24 +453,6 @@ fn offered_tools() -> Vec<ToolSchema> {
             }),
         ),
         schema(
-            "jev",
-            "Ask the fast gate one question. It may read one file, then answers continue, stop, compact, or steer. It does not write or run commands.",
-            json!({
-                "type":"object",
-                "properties":{"question":{"type":"string"}},
-                "required":["question"]
-            }),
-        ),
-        schema(
-            "advise",
-            "Ask the read-only advisor one question. It does not write or run commands.",
-            json!({
-                "type":"object",
-                "properties":{"question":{"type":"string"}},
-                "required":["question"]
-            }),
-        ),
-        schema(
             "child",
             "Run one command in the workspace jail for at most 30 seconds.",
             json!({

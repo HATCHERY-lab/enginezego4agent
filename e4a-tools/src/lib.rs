@@ -138,7 +138,7 @@ pub async fn run_until_answer_in<L: Llm>(
         if iterations >= MODEL_CALL_CAP {
             break;
         }
-        run_waiting_gated(session, outcome.task_id, workspace, Some(llm)).await?;
+        run_waiting_gated(session, outcome.task_id, workspace).await?;
         outcome = Generation::bind(outcome.task_id, input.conversation_id)
             .continue_after_tool(session, llm)
             .await?;
@@ -158,50 +158,16 @@ pub async fn run_waiting_tool(
     generation_task_id: i64,
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
-    run_waiting_gated::<e4a_llm::FauxLlm>(session, generation_task_id, workspace, None).await
+    run_waiting_gated(session, generation_task_id, workspace).await
 }
 
-async fn run_waiting_gated<L: Llm>(
+async fn run_waiting_gated(
     session: &Session,
     generation_task_id: i64,
     workspace: &Workspace,
-    llm: Option<&L>,
 ) -> Result<ToolOutcome, Error> {
     let pending = load_waiting(session, generation_task_id).await?;
-    let effect = if pending.name == "jev" {
-        let Some(llm) = llm else {
-            return Err(Error::message("jev needs a model"));
-        };
-        let question = pending
-            .arguments
-            .get("question")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let decision = crate::jev_gate::run_jev_ask(llm, workspace, question).await?;
-        ToolEffect {
-            is_error: false,
-            content: crate::jev_gate::render(&decision),
-        }
-    } else if pending.name == "advise" {
-        let Some(llm) = llm else {
-            return Err(Error::message("advise needs a model"));
-        };
-        let question = pending
-            .arguments
-            .get("question")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        match e4a_harness::advise(llm, question).await {
-            Ok(text) => ToolEffect {
-                is_error: false,
-                content: text,
-            },
-            Err(text) => ToolEffect {
-                is_error: true,
-                content: text,
-            },
-        }
-    } else if pending.name == "child" {
+    let effect = if pending.name == "child" {
         child_effect(
             generation_task_id,
             pending.tool_task_id,

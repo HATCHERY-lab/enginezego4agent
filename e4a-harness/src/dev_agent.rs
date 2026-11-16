@@ -17,12 +17,13 @@ pub struct AgentRole {
 /// Developer role.
 ///
 /// File changes go through tools. A model thought is not a tool result and is
-/// not stored as context.
+/// not stored as context. Only working tools are offered: the gate and the
+/// advisor are not tools the worker calls (owner directive 2026-11-16).
 pub fn dev_agent() -> AgentRole {
     AgentRole {
         id: "dev",
         model: "cohere/north-mini-code:free",
-        tools: &["read", "write", "edit", "edit_all", "powershell", "jev", "advise", "child"],
+        tools: &["read", "write", "edit", "edit_all", "powershell", "child"],
         instructions: "You are the developer. Change files only through tools. \
 Do not claim a file changed unless a tool result says so. \
 Thinking from the model is not stored as context.",
@@ -33,7 +34,7 @@ Thinking from the model is not stored as context.",
 ///
 /// A name only. Nothing is called.
 pub fn fallback_model() -> &'static str {
-    "minimax/minimax-m3.1-flash"
+    "google/gemma-4-31b-it:free"
 }
 
 #[cfg(test)]
@@ -47,7 +48,7 @@ mod tests {
         assert_eq!(role.model, "cohere/north-mini-code:free");
         assert_eq!(
             role.tools,
-            &["read", "write", "edit", "edit_all", "powershell", "jev", "advise", "child"][..]
+            &["read", "write", "edit", "edit_all", "powershell", "child"][..]
         );
         assert!(role.instructions.contains("You are the developer."));
         assert!(role
@@ -56,7 +57,7 @@ mod tests {
         assert!(role
             .instructions
             .contains("Thinking from the model is not stored as context."));
-        assert_eq!(fallback_model(), "minimax/minimax-m3.1-flash");
+        assert_eq!(fallback_model(), "google/gemma-4-31b-it:free");
         assert_ne!(role.model, fallback_model());
     }
 }

@@ -23,7 +23,7 @@ pub fn advisor_agent() -> AgentRole {
 
 /// Model used when the advisor model is unavailable.
 pub fn advisor_fallback() -> &'static str {
-    "minimax/minimax-m3.1-flash"
+    "google/gemma-4-31b-it:free"
 }
 
 #[cfg(test)]

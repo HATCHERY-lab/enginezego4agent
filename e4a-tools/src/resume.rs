@@ -14,12 +14,11 @@ const ROUNDS: usize = 8;
 
 /// Run every waiting tool and release its generation.
 ///
-/// `llm` is used only for `jev` and `advise`. Other tools do not call it.
-/// An empty result means nothing was waiting.
-pub async fn resume_waiting<L: Llm>(
+/// No model is called: a waiting tool is workspace work. An empty result
+/// means nothing was waiting.
+pub async fn resume_waiting(
     session: &Session,
     workspace: &Workspace,
-    llm: &L,
 ) -> Result<Vec<ToolOutcome>, Error> {
     let waiting = session
         .scan_tasks(TaskQuery {
@@ -35,7 +34,7 @@ pub async fn resume_waiting<L: Llm>(
         if waiting_tool_id(task.id, &task.state).is_err() {
             continue;
         }
-        let outcome = run_waiting_gated(session, task.id, workspace, Some(llm)).await?;
+        let outcome = run_waiting_gated(session, task.id, workspace).await?;
         Generation::bind(task.id, task.conversation_id)
             .release_finished_tool(session)
             .await?;
@@ -54,7 +53,7 @@ pub async fn resume_turns<L: Llm>(
     workspace: &Workspace,
     llm: &L,
 ) -> Result<Vec<TurnOutcome>, Error> {
-    let finished = resume_waiting(session, workspace, llm).await?;
+    let finished = resume_waiting(session, workspace).await?;
     let mut turns = Vec::new();
     let mut seen = Vec::new();
     for tool in finished {
@@ -78,7 +77,7 @@ pub async fn resume_turns<L: Llm>(
                     "interrupted turn did not answer",
                 ));
             }
-            let again = resume_waiting(session, workspace, llm).await?;
+            let again = resume_waiting(session, workspace).await?;
             if again.is_empty() {
                 return Err(Error::message(
                     "generation is waiting but no tool ran",

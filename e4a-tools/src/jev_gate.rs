@@ -10,28 +10,6 @@ use crate::{Error, Workspace};
 const ROUNDS: usize = 2;
 const READ_CAP: usize = 500;
 
-/// The worker asked `jev` a question. Same two-call cap and the same tools.
-pub async fn run_jev_ask<L: Llm>(
-    llm: &L,
-    workspace: &Workspace,
-    question: &str,
-) -> Result<JevDecision, Error> {
-    if question.trim().is_empty() {
-        return Err(Error::message("jev question is empty"));
-    }
-    let arguments = serde_json::json!({"question": question});
-    run_jev_gate(llm, workspace, "jev", &arguments, 0).await
-}
-
-pub fn render(decision: &JevDecision) -> String {
-    match decision {
-        JevDecision::Continue => "continue".into(),
-        JevDecision::Stop { .. } => "stop".into(),
-        JevDecision::Compact => "compact".into(),
-        JevDecision::Steer { text } => format!("steer: {text}"),
-    }
-}
-
 /// Ask the fast model what to do with one pending worker tool.
 ///
 /// A destructive command stops before any model call. `read` is the only
