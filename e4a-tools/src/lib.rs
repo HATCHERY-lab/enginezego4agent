@@ -140,7 +140,7 @@ pub async fn run_until_answer_in<L: Llm>(
         if iterations >= MODEL_CALL_CAP {
             break;
         }
-        run_waiting_gated(session, outcome.task_id, workspace).await?;
+        run_round(session, outcome.task_id, workspace).await?;
         outcome = Generation::bind(outcome.task_id, input.conversation_id)
             .continue_after_tool(session, llm)
             .await?;
@@ -160,15 +160,49 @@ pub async fn run_waiting_tool(
     generation_task_id: i64,
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
-    run_waiting_gated(session, generation_task_id, workspace).await
+    let (_, tool_task_id) = waiting_of(session, generation_task_id).await?;
+    run_waiting_gated(session, generation_task_id, tool_task_id, workspace).await
+}
+
+/// Run every waiting tool of one generation's current round, in call order.
+/// The generation is released only when the whole batch is terminal, which
+/// [`Generation::release_finished_tool`] enforces on its side.
+pub async fn run_round(
+    session: &Session,
+    generation_task_id: i64,
+    workspace: &Workspace,
+) -> Result<Vec<ToolOutcome>, Error> {
+    let (state, _) = waiting_of(session, generation_task_id).await?;
+    let ids = waiting_tool_ids(generation_task_id, &state)?;
+    let mut outcomes = Vec::with_capacity(ids.len());
+    for tool_task_id in ids {
+        outcomes.push(
+            run_waiting_gated(session, generation_task_id, tool_task_id, workspace).await?,
+        );
+    }
+    Ok(outcomes)
+}
+
+/// The generation's waiting state and its first tool task id.
+async fn waiting_of(
+    session: &Session,
+    generation_task_id: i64,
+) -> Result<(e4a_types::TaskState, i64), Error> {
+    let generation = session
+        .task(generation_task_id)
+        .await?
+        .ok_or_else(|| Error::message(format!("task {generation_task_id} does not exist")))?;
+    let first = waiting_tool_id(generation_task_id, &generation.state)?;
+    Ok((generation.state, first))
 }
 
 async fn run_waiting_gated(
     session: &Session,
     generation_task_id: i64,
+    tool_task_id: i64,
     workspace: &Workspace,
 ) -> Result<ToolOutcome, Error> {
-    let pending = load_waiting(session, generation_task_id).await?;
+    let pending = load_pending(session, generation_task_id, tool_task_id).await?;
     let effect = if pending.name == "child" {
         child_effect(
             generation_task_id,
@@ -265,12 +299,16 @@ fn child_effect(
     }
 }
 
-async fn load_waiting(session: &Session, generation_task_id: i64) -> Result<PendingTool, Error> {
+async fn load_pending(
+    session: &Session,
+    generation_task_id: i64,
+    tool_task_id: i64,
+) -> Result<PendingTool, Error> {
     let generation = session
         .task(generation_task_id)
         .await?
         .ok_or_else(|| Error::message(format!("task {generation_task_id} does not exist")))?;
-    let tool_task_id = waiting_tool_id(generation_task_id, &generation.state)?;
+    let _ = waiting_tool_ids(generation_task_id, &generation.state)?;
     let tool = session
         .task(tool_task_id)
         .await?
@@ -341,6 +379,15 @@ async fn load_waiting(session: &Session, generation_task_id: i64) -> Result<Pend
 }
 
 fn waiting_tool_id(generation_id: i64, state: &TaskState) -> Result<i64, Error> {
+    waiting_tool_ids(generation_id, state)?
+        .first()
+        .copied()
+        .ok_or_else(|| Error::message("tool round has no tool task"))
+}
+
+/// Every waiting tool task id of the generation's current round. Round order
+/// is call order.
+pub fn waiting_tool_ids(generation_id: i64, state: &TaskState) -> Result<Vec<i64>, Error> {
     let TaskState::Waiting { checkpoint, .. } = state else {
         return Err(Error::message(format!(
             "generation {generation_id} is not waiting on a tool"
@@ -351,12 +398,15 @@ fn waiting_tool_id(generation_id: i64, state: &TaskState) -> Result<i64, Error> 
             "generation {generation_id} is not waiting on a tool"
         )));
     }
-    checkpoint
+    let ids = checkpoint
         .get("tools")
         .and_then(Json::as_array)
-        .and_then(|tools| tools.first())
-        .and_then(Json::as_i64)
-        .ok_or_else(|| Error::message("tool round has no tool task"))
+        .map(|tools| tools.iter().filter_map(Json::as_i64).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Err(Error::message("tool round has no tool task"));
+    }
+    Ok(ids)
 }
 
 fn tool_arguments(entry: &EntryRecord, call_id: &str, name: &str) -> Result<Json, Error> {

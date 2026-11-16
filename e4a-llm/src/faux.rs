@@ -1,4 +1,4 @@
-//! Scripted assistant turns. No key and no network: tests replay text and at most one tool call.
+//! Scripted assistant turns. No key and no network: tests replay text and tool calls.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +9,7 @@ use crate::{Error, EventStream, Llm, LlmEvent, ToolCall, TurnRequest, Usage};
 #[derive(Clone, Debug)]
 struct Script {
     text: String,
-    tool_call: Option<ToolCall>,
+    tool_calls: Vec<ToolCall>,
     usage: Usage,
     fail: Option<String>,
 }
@@ -18,7 +18,7 @@ impl Script {
     fn text(text: String) -> Self {
         Self {
             text,
-            tool_call: None,
+            tool_calls: Vec::new(),
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -35,7 +35,7 @@ impl Script {
         if !self.text.is_empty() {
             events.push(LlmEvent::Text(self.text.clone()));
         }
-        if let Some(call) = &self.tool_call {
+        for call in &self.tool_calls {
             events.push(LlmEvent::ToolCall(call.clone()));
         }
         events.push(LlmEvent::Usage(self.usage.clone()));
@@ -84,7 +84,15 @@ impl FauxLlm {
     /// Attach a tool call to the last scripted turn.
     pub fn with_tool_call(mut self, call: ToolCall) -> Self {
         if let Some(turn) = self.turns.last_mut() {
-            turn.tool_call = Some(call);
+            turn.tool_calls.push(call);
+        }
+        self
+    }
+
+    /// Attach several tool calls to one scripted turn, in call order.
+    pub fn with_tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.tool_calls.extend(calls);
         }
         self
     }

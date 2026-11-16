@@ -100,7 +100,7 @@ struct RequestCheckpoint {
 
 struct Answer {
     text: String,
-    tool: Option<ToolCall>,
+    tools: Vec<ToolCall>,
     usage: Usage,
 }
 
@@ -252,13 +252,13 @@ impl Generation {
                     .commit(|tx| turn_request(tx, self, &checkpoint))
                     .await?;
                 let answer = collect_answer(llm, &request).await.map_err(failed_model)?;
-                if answer.tool.is_some() {
+                if !answer.tools.is_empty() {
                     crate::gate_board::park_turn(self.task_id)?;
                 }
                 let entry_id = session
                     .commit(|tx| commit_answer(tx, self, &checkpoint, &answer))
                     .await?;
-                if answer.tool.is_none() {
+                if answer.tools.is_empty() {
                     let lines = [Line {
                         entry_id,
                         text: answer.text.clone(),
@@ -293,9 +293,10 @@ impl Generation {
                         Err(message) => return Err(Error::message(message)),
                     }
                 }
-                let (name, finished, ended) = match &answer.tool {
-                    Some(call) => (call.name.clone(), false, None),
-                    None => ("answer".to_owned(), true, Some("end_turn")),
+                let (name, finished, ended) = if let Some(call) = answer.tools.first() {
+                    (call.name.clone(), false, None)
+                } else {
+                    ("answer".to_owned(), true, Some("end_turn"))
                 };
                 let slots = [(self.task_id, name, finished)];
                 session
@@ -315,7 +316,7 @@ impl Generation {
                     .await?
                     .and_then(|task| task.restarts)
                     .unwrap_or(checkpoint.failed_attempts);
-                let kind = if answer.tool.is_some() {
+                let kind = if !answer.tools.is_empty() {
                     let tool_task_id = tool_task_id(session, self.task_id).await?;
                     TurnKind::WaitingTool {
                         entry_id,
@@ -730,20 +731,27 @@ fn release_after_tool(tx: &mut Tx, generation: &Generation) -> Result<(), e4a_se
         ));
     }
     let model_calls = checkpoint_model_calls(&checkpoint);
-    let tool_task_id = first_tool_id(&checkpoint)?;
-    let tool = load_task(tx, tool_task_id)?;
-    if tool.kind != TOOL_KIND {
-        return Err(e4a_session::Error::message(format!(
-            "task {} is not a tool",
-            tool.id
-        )));
+    let tool_id_list = tool_ids(&checkpoint)?;
+    let mut entry_id = None;
+    for tool_task_id in tool_id_list {
+        let tool = load_task(tx, tool_task_id)?;
+        if tool.kind != TOOL_KIND {
+            return Err(e4a_session::Error::message(format!(
+                "task {} is not a tool",
+                tool.id
+            )));
+        }
+        if tool.owner != Some(generation.task_id) {
+            return Err(e4a_session::Error::message(
+                "tool task is not owned by this generation",
+            ));
+        }
+        // The cutoff is the batch's last result: the next request must see
+        // every result of the round, and entry ids only grow.
+        entry_id = Some(tool_result_entry(tx, &tool)?.max(entry_id.unwrap_or(i64::MIN)));
     }
-    if tool.owner != Some(generation.task_id) {
-        return Err(e4a_session::Error::message(
-            "tool task is not owned by this generation",
-        ));
-    }
-    let entry_id = tool_result_entry(tx, &tool)?;
+    let entry_id = entry_id
+        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))?;
     let stored: GenerationInput = serde_json::from_value(task.input.clone())
         .map_err(|err| e4a_session::Error::message(err.to_string()))?;
     let request = RequestCheckpoint {
@@ -780,12 +788,25 @@ fn stop_for_model_cap(tx: &mut Tx, task_id: i64) -> Result<(), e4a_session::Erro
 }
 
 fn first_tool_id(checkpoint: &Json) -> Result<i64, e4a_session::Error> {
-    checkpoint
+    tool_ids(checkpoint)?
+        .first()
+        .copied()
+        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))
+}
+
+/// Every tool task id of the round, in call order.
+fn tool_ids(checkpoint: &Json) -> Result<Vec<i64>, e4a_session::Error> {
+    let ids = checkpoint
         .get("tools")
         .and_then(Json::as_array)
-        .and_then(|tools| tools.first())
-        .and_then(Json::as_i64)
-        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))
+        .ok_or_else(|| e4a_session::Error::message("tool round has no tool task"))?
+        .iter()
+        .filter_map(Json::as_i64)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(e4a_session::Error::message("tool round has no tool task"));
+    }
+    Ok(ids)
 }
 
 fn checkpoint_model_calls(checkpoint: &Json) -> i64 {
@@ -837,27 +858,20 @@ async fn collect_answer<L: Llm>(llm: &L, request: &TurnRequest) -> Result<Answer
     let mut stream = llm.stream(request).await?;
     let events = drain(&mut stream).await?;
     let mut text = String::new();
-    let mut tool = None;
+    let mut tools = Vec::new();
     let mut usage = None;
     for event in events {
         match event {
             LlmEvent::Text(chunk) => text.push_str(&chunk),
-            LlmEvent::ToolCall(call) => {
-                if tool.is_some() {
-                    return Err(Error::message(
-                        "only one tool call is committed in this slice",
-                    ));
-                }
-                tool = Some(call);
-            }
+            LlmEvent::ToolCall(call) => tools.push(call),
             LlmEvent::Usage(next) => usage = Some(next),
         }
     }
-    if text.is_empty() && tool.is_none() {
+    if text.is_empty() && tools.is_empty() {
         return Err(Error::message("model turn was empty"));
     }
     let usage = usage.ok_or_else(|| Error::message("model turn did not report usage"))?;
-    Ok(Answer { text, tool, usage })
+    Ok(Answer { text, tools, usage })
 }
 
 async fn drain(stream: &mut EventStream) -> Result<Vec<LlmEvent>, Error> {
@@ -920,14 +934,13 @@ fn commit_answer(
 ) -> Result<i64, e4a_session::Error> {
     let task = load_task(tx, generation.task_id)?;
     record_usage(tx, generation.conversation_id, &answer.usage)?;
-    let saw_tool = answer.tool.is_some();
-    let stored_arguments = match &answer.tool {
-        Some(call) => Some(round_arguments(&task, call)?),
-        None => None,
-    };
+    let mut stored_arguments = Vec::with_capacity(answer.tools.len());
+    for call in &answer.tools {
+        stored_arguments.push(round_arguments(&task, call)?);
+    }
     let mut entry_id = None;
     let mut tool_started = false;
-    for step in plan(saw_tool) {
+    for step in plan(!answer.tools.is_empty()) {
         match step {
             PlanStep::Prepare | PlanStep::Request => {}
             PlanStep::AppendAssistant => {
@@ -935,17 +948,19 @@ fn commit_answer(
                     tx,
                     generation,
                     answer,
-                    stored_arguments.as_ref(),
+                    &stored_arguments,
                 )?);
             }
             PlanStep::AppendTool => {
                 let id = entry_id.ok_or_else(|| {
                     e4a_session::Error::message("tool round has no assistant entry")
                 })?;
-                let call = answer.tool.as_ref().ok_or_else(|| {
-                    e4a_session::Error::message("tool round has no tool call")
-                })?;
-                start_tool_task(tx, generation, &task, checkpoint, call, id)?;
+                if answer.tools.is_empty() {
+                    return Err(e4a_session::Error::message(
+                        "tool round has no tool call",
+                    ));
+                }
+                start_tool_tasks(tx, generation, &task, checkpoint, &answer.tools, id)?;
                 tool_started = true;
             }
             PlanStep::Settle => {
@@ -966,13 +981,13 @@ fn append_assistant(
     tx: &mut Tx,
     generation: &Generation,
     answer: &Answer,
-    arguments: Option<&Json>,
+    arguments: &[Json],
 ) -> Result<i64, e4a_session::Error> {
     let mut content = Vec::new();
     if !answer.text.is_empty() {
         content.push(json!({ "type": "text", "text": answer.text }));
     }
-    if let (Some(call), Some(arguments)) = (&answer.tool, arguments) {
+    for (call, arguments) in answer.tools.iter().zip(arguments) {
         content.push(json!({
             "type": "toolCall",
             "id": call.id,
@@ -980,7 +995,7 @@ fn append_assistant(
             "arguments": arguments,
         }));
     }
-    let stop = stop_reason(answer.tool.is_some(), false);
+    let stop = stop_reason(!answer.tools.is_empty(), false);
     let entry = tx.append_entry(
         generation.conversation_id,
         EntryDraft {
@@ -1005,46 +1020,54 @@ fn append_assistant(
     Ok(entry.id)
 }
 
-fn start_tool_task(
+/// One `pi.tool` task per call of the round. The generation waits on all of
+/// them at once (`tools` lists every id), so a model that calls tools in
+/// parallel has the whole batch run before its next request.
+fn start_tool_tasks(
     tx: &mut Tx,
     generation: &Generation,
     task: &TaskRecord,
     checkpoint: &RequestCheckpoint,
-    call: &ToolCall,
+    calls: &[ToolCall],
     entry_id: i64,
 ) -> Result<(), e4a_session::Error> {
-    let tool = tx.create_task(TaskCreate {
-        kind: TOOL_KIND.into(),
-        version: 3,
-        conversation_id: generation.conversation_id,
-        input: json!({
-            "kind": "model",
-            "assistant": entry_id,
-            "callId": call.id,
-            "name": call.name,
-        }),
-        owner: Some(generation.task_id),
-        background: false,
-        checkpoint: json!({ "phase": "call" }),
-    })?;
-    let mut waiting = tool.clone();
-    waiting.state = TaskState::Waiting {
-        checkpoint: json!({ "phase": "call" }),
-        on: Vec::new(),
-        policy: JoinPolicy::AllSettled,
-    };
-    tx.set_task(waiting)?;
+    let mut tool_ids = Vec::with_capacity(calls.len());
+    for call in calls {
+        let tool = tx.create_task(TaskCreate {
+            kind: TOOL_KIND.into(),
+            version: 3,
+            conversation_id: generation.conversation_id,
+            input: json!({
+                "kind": "model",
+                "assistant": entry_id,
+                "callId": call.id,
+                "name": call.name,
+            }),
+            owner: Some(generation.task_id),
+            background: false,
+            checkpoint: json!({ "phase": "call" }),
+        })?;
+        let mut waiting = tool.clone();
+        waiting.state = TaskState::Waiting {
+            checkpoint: json!({ "phase": "call" }),
+            on: Vec::new(),
+            policy: JoinPolicy::AllSettled,
+        };
+        tx.set_task(waiting)?;
+        tool_ids.push(json!(tool.id));
+    }
     let mut parent = task.clone();
     let model_calls = checkpoint.model_calls.saturating_add(1);
+    let on: Vec<i64> = tool_ids.iter().filter_map(Json::as_i64).collect();
     parent.state = TaskState::Waiting {
         checkpoint: json!({
             "phase": "tools",
             "assistant": entry_id,
-            "tools": [tool.id],
+            "tools": tool_ids,
             "pending": [],
             "modelCalls": model_calls,
         }),
-        on: vec![tool.id],
+        on,
         policy: JoinPolicy::AllSettled,
     };
     tx.set_task(parent)?;

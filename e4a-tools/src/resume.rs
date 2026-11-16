@@ -7,7 +7,7 @@ use e4a_llm::Llm;
 use e4a_session::Session;
 use e4a_types::{TaskQuery, TaskStatus};
 
-use crate::{run_waiting_gated, waiting_tool_id, Error, ToolOutcome, Workspace};
+use crate::{run_round, waiting_tool_id, Error, ToolOutcome, Workspace};
 
 const GENERATION_KIND: &str = "pi.generation";
 const ROUNDS: usize = 8;
@@ -34,11 +34,11 @@ pub async fn resume_waiting(
         if waiting_tool_id(task.id, &task.state).is_err() {
             continue;
         }
-        let outcome = run_waiting_gated(session, task.id, workspace).await?;
+        let outcomes = run_round(session, task.id, workspace).await?;
         Generation::bind(task.id, task.conversation_id)
             .release_finished_tool(session)
             .await?;
-        finished.push(outcome);
+        finished.extend(outcomes);
     }
     Ok(finished)
 }

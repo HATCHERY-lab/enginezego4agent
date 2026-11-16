@@ -1121,14 +1121,11 @@ fn finish_accum(accum: Accum, configured_model: &str) -> Result<Vec<LlmEvent>, E
         }
         _ => {}
     }
-    if accum.calls.len() > 1 {
-        return Err(Error::message("only one tool call is committed in this slice"));
-    }
     let mut events = Vec::new();
     if !accum.text.is_empty() {
         events.push(LlmEvent::Text(accum.text));
     }
-    if let Some((_, call)) = accum.calls.iter().next() {
+    for (_, call) in &accum.calls {
         if call.id.is_empty() || call.name.is_empty() {
             return Err(Error::message("tool call was incomplete"));
         }
@@ -1292,10 +1289,21 @@ data: [DONE]\n";
     }
 
     #[test]
-    fn two_tool_calls_are_rejected() {
-        let body = r#"{"model":"vendor/model","choices":[{"message":{"content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"read","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
-        let error = events_from_body(body, "configured").unwrap_err();
-        assert_eq!(error.to_string(), "only one tool call is committed in this slice");
+    fn parallel_tool_calls_become_events_in_call_order() {
+        let body = r#"{"model":"vendor/model","choices":[{"message":{"content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"write","arguments":"{\"path\":\"a.txt\"}"}},{"id":"b","type":"function","function":{"name":"write","arguments":"{\"path\":\"b.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let events = events_from_body(body, "configured").unwrap();
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                LlmEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "a");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
+        assert_eq!(calls[1].id, "b");
+        assert_eq!(calls[1].arguments["path"], "b.txt");
     }
 
     #[test]
