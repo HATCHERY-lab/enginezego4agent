@@ -279,7 +279,36 @@ async fn run_waiting_gated(
                 content: text,
             },
             ez4a_harness::JevDecision::Continue | ez4a_harness::JevDecision::Compact => {
-                workspace.call(&pending.name, &pending.arguments)
+                let model = std::env::var("EZ4A_JEV_MODEL").unwrap_or_default();
+                if model.is_empty() {
+                    workspace.call(&pending.name, &pending.arguments)
+                } else {
+                    let gate = ez4a_llm::OpenRouterClient::new(model);
+                    match crate::jev_gate::run_jev_gate(
+                        &gate,
+                        workspace,
+                        &pending.name,
+                        &pending.arguments,
+                        0,
+                    )
+                    .await
+                    {
+                        Ok(ez4a_harness::JevDecision::Stop { reason }) => ToolEffect {
+                            is_error: true,
+                            content: format!("jev stopped the step: {reason}"),
+                        },
+                        Ok(ez4a_harness::JevDecision::Steer { text }) => ToolEffect {
+                            is_error: true,
+                            content: format!("jev steers instead: {text}"),
+                        },
+                        Ok(_) => workspace.call(&pending.name, &pending.arguments),
+                        Err(error) => {
+                            // A dead gate never blocks the worker.
+                            workspace.call(&pending.name, &pending.arguments)
+                                .note_gate_failure(&error.to_string())
+                        }
+                    }
+                }
             }
         }
     };
@@ -302,6 +331,17 @@ async fn run_waiting_gated(
 /// An empty command does not spawn. `spawn_child` only records the child.
 /// [`ez4a_env::LocalEnv::start_child`] is the process. A non-zero exit is an
 /// error result whose text is stderr. A zero exit is stdout.
+impl ToolEffect {
+    /// A failed gate is a warning the worker sees, not a refusal: the local
+    /// rules already passed and the tool itself ran.
+    fn note_gate_failure(self, warning: &str) -> Self {
+        ToolEffect {
+            is_error: self.is_error,
+            content: format!("{}, jev gate unavailable: {warning}", self.content),
+        }
+    }
+}
+
 async fn mail_effect(call: impl std::future::Future<Output = Result<String, Error>>) -> ToolEffect {
     match call.await {
         Ok(text) => ToolEffect {
