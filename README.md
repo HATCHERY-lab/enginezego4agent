@@ -1,4 +1,4 @@
-# engine4agent (e4a)
+# engine zero for agents (ez4a)
 
 Durable agent engine for Hatchery: give it an API key or an inference endpoint,
 get an agent with tools, sessions, forks, checkpointed tasks and cost accounting
@@ -8,7 +8,7 @@ other review/automation loops.
 
 ## Origin and attribution
 
-e4a is a Rust port of **pi-durable 1.5.2**
+ez4a is a Rust port of **pi-durable 1.5.2**
 ([`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/v1.5.2/packages/durable),
 tag `v1.5.2` = `b4afdddf44e059c67ccf5097e5317d913521b470`) by Earendil Works —
 Mario Zechner and Armin Ronacher — released under the MIT License. We are
@@ -26,12 +26,12 @@ Working code lives in the Hatchery **federated git trees** (tree `agent4agent`).
 This private repository is an **independent origin for checkpoints**: snapshots
 are pushed here after each stage, never force-pushed.
 
-Plan: `hatchery-websession-docs/docs/plans/engine4agent.md`.
+Plan: `hatchery-websession-docs/docs/plans/engine zero for agents.md`.
 
 ## Store
 
 Document deltas are Chord operations (`set`, `splice`, and the other `Op` variants
-in `e4a-types`). Those operations are not RFC 6902, so `e4a-types/src/apply.rs`
+in `ez4a-types`). Those operations are not RFC 6902, so `ez4a-types/src/apply.rs`
 applies them directly. The `json-patch` crate is the wrong tool for that and is
 not a dependency.
 

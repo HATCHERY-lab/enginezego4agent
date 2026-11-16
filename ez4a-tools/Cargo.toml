@@ -1,0 +1,27 @@
+[package]
+name = "ez4a-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem tools for engine zero for agents"
+publish = false
+
+[dependencies]
+ez4a-codemode = { path = "../ez4a-codemode" }
+ez4a-env = { path = "../ez4a-env" }
+ez4a-harness = { path = "../ez4a-harness" }
+ez4a-llm = { path = "../ez4a-llm" }
+ez4a-session = { path = "../ez4a-session" }
+ez4a-types = { path = "../ez4a-types" }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["process", "time", "net", "io-util", "rt"] }
+# Optional: a normal check does not compile photon-rs (native image codecs).
+photon-rs = { version = "0.3", optional = true }
+
+[features]
+default = []
+photon = ["dep:photon-rs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

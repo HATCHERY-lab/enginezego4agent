@@ -331,110 +331,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
-name = "e4a-codemode"
-version = "0.1.0"
-dependencies = [
- "quickjs-jit",
- "quickjs-jit-runtime",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "e4a-env"
-version = "0.1.0"
-dependencies = [
- "notify",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "e4a-harness"
-version = "0.1.0"
-dependencies = [
- "e4a-llm",
- "e4a-session",
- "e4a-store",
- "e4a-types",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "e4a-host"
-version = "0.1.0"
-dependencies = [
- "e4a-harness",
- "e4a-llm",
- "e4a-session",
- "e4a-tools",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "e4a-llm"
-version = "0.1.0"
-dependencies = [
- "rustls",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "e4a-session"
-version = "0.1.0"
-dependencies = [
- "e4a-store",
- "e4a-types",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "e4a-store"
-version = "0.1.0"
-dependencies = [
- "e4a-types",
- "rusqlite",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "e4a-tools"
-version = "0.1.0"
-dependencies = [
- "e4a-codemode",
- "e4a-env",
- "e4a-harness",
- "e4a-llm",
- "e4a-session",
- "e4a-types",
- "photon-rs",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "e4a-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,6 +353,120 @@ name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "errno"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ez4a-codemode"
+version = "0.1.0"
+dependencies = [
+ "quickjs-jit",
+ "quickjs-jit-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ez4a-env"
+version = "0.1.0"
+dependencies = [
+ "notify",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ez4a-harness"
+version = "0.1.0"
+dependencies = [
+ "ez4a-llm",
+ "ez4a-session",
+ "ez4a-store",
+ "ez4a-types",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ez4a-host"
+version = "0.1.0"
+dependencies = [
+ "ez4a-harness",
+ "ez4a-llm",
+ "ez4a-session",
+ "ez4a-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ez4a-llm"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ez4a-session"
+version = "0.1.0"
+dependencies = [
+ "ez4a-store",
+ "ez4a-types",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ez4a-store"
+version = "0.1.0"
+dependencies = [
+ "ez4a-types",
+ "rusqlite",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ez4a-tools"
+version = "0.1.0"
+dependencies = [
+ "ez4a-codemode",
+ "ez4a-env",
+ "ez4a-harness",
+ "ez4a-llm",
+ "ez4a-session",
+ "ez4a-types",
+ "photon-rs",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ez4a-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -1490,6 +1500,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simba"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1670,6 +1690,7 @@ dependencies = [
  "libc",
  "mio 1.2.4",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
