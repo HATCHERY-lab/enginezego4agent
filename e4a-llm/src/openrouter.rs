@@ -426,8 +426,29 @@ async fn within<T>(label: &str, limit: Duration, fut: impl Future<Output = Resul
 }
 
 async fn exchange(endpoint: &SocksEndpoint, key: &str, body: &[u8]) -> Result<String, Error> {
+    let first = exchange_once(endpoint, key, body).await;
+    if !matches!(&first, Err(error) if dead_flow(error)) {
+        return first;
+    }
+    // A door flow can open and still carry nothing: the edge blackholes it and
+    // the dial or the header read dies with no response. One redial covers
+    // that; a turn that timed out on its own is not retried here.
+    exchange_once(endpoint, key, body).await
+}
+
+async fn exchange_once(endpoint: &SocksEndpoint, key: &str, body: &[u8]) -> Result<String, Error> {
     let mut tls = within("socks5 dial", DIAL_TIMEOUT, dial_tls(endpoint)).await?;
     within("openrouter", TURN_TIMEOUT, http_roundtrip(&mut tls, key, body)).await
+}
+
+/// True when the failure means the flow was dead before any response byte:
+/// the dial or TLS handshake never finished, or the connection closed before
+/// headers arrived. No response was received, so a replay is safe.
+fn dead_flow(error: &Error) -> bool {
+    let text = error.to_string();
+    text.starts_with("socks5 dial")
+        || text.starts_with("tls handshake")
+        || text.starts_with("openrouter connection closed")
 }
 
 async fn dial_tls(endpoint: &SocksEndpoint) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Error> {
@@ -1325,5 +1346,21 @@ X-RateLimit-Reset: 2026-11-17T00:00:00.000Z\r\n\r\n";
             panic!("no usage event");
         };
         assert_eq!(usage.cost_usd, 0.0000031);
+    }
+
+    #[test]
+    fn only_a_dead_flow_is_redialed() {
+        assert!(dead_flow(&Error::message("socks5 dial timed out")));
+        assert!(dead_flow(&Error::message(
+            "socks5 dial 127.0.0.1:18110: connection refused"
+        )));
+        assert!(dead_flow(&Error::message("tls handshake timed out")));
+        assert!(dead_flow(&Error::message(
+            "openrouter connection closed before headers"
+        )));
+        assert!(dead_flow(&Error::message("openrouter connection closed early")));
+        assert!(!dead_flow(&Error::message("openrouter timed out")));
+        assert!(!dead_flow(&Error::message("openrouter status 429: limited")));
+        assert!(!dead_flow(&Error::message("openrouter json: bad body")));
     }
 }
