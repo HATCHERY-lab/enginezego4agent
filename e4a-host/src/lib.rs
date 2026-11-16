@@ -263,6 +263,7 @@ async fn faux_prompt(
         output_tokens: 1,
         provider: "faux".into(),
         model: "scripted".into(),
+        cost_usd: 0.0,
     });
     memory_prompt(user_text, root, &llm, openrouter).await
 }
@@ -275,19 +276,31 @@ async fn openrouter_prompt(
     openrouter: bool,
 ) -> Result<(String, Vec<String>, Vec<Value>), String> {
     let from_env = std::env::var("E4A_MODEL").ok();
-    let model = session_model(root).unwrap_or_else(|| openrouter_model(from_env.as_deref()));
+    let model = session_model(root).unwrap_or_else(|| {
+        role_model(
+            from_env.as_deref(),
+            std::env::var("E4A_DEV_MODEL").ok().as_deref(),
+            e4a_harness::dev_agent().model,
+        )
+    });
     let llm = OpenRouterClient::new(model)
         .with_socks(socks)
         .with_key(key);
     memory_prompt(user_text, root, &llm, openrouter).await
 }
 
-/// `E4A_MODEL` when it is set and non-empty. Otherwise `openrouter/auto`.
-fn openrouter_model(from_env: Option<&str>) -> String {
-    match from_env {
-        Some(model) if !model.is_empty() => model.to_string(),
-        _ => "openrouter/auto".to_string(),
+/// `E4A_MODEL` wins over the role's own `E4A_<ROLE>_MODEL`; the role's
+/// default is last. An empty value counts as unset. Advisor and gate
+/// sessions resolve the same way against `E4A_ADVISOR_MODEL` and
+/// `E4A_JEV_MODEL` when they arrive. `openrouter/auto` stays reachable by
+/// setting `E4A_MODEL` to it.
+fn role_model(global: Option<&str>, own: Option<&str>, role_default: &str) -> String {
+    for value in [global, own] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            return value.to_string();
+        }
     }
+    role_default.to_string()
 }
 
 async fn memory_prompt(
@@ -580,7 +593,11 @@ async fn replay(cwd: &str, session_id: &str) -> Result<Vec<Value>, String> {
     let openrouter = prompt_backend(socks.as_deref(), key.as_deref()) == "openrouter";
     let finished = if openrouter {
         let model = session_model(session_id).unwrap_or_else(|| {
-            openrouter_model(std::env::var("E4A_MODEL").ok().as_deref())
+            role_model(
+                std::env::var("E4A_MODEL").ok().as_deref(),
+                std::env::var("E4A_DEV_MODEL").ok().as_deref(),
+                e4a_harness::dev_agent().model,
+            )
         });
         let llm = OpenRouterClient::new(model)
             .with_socks(socks.unwrap_or_default())
@@ -814,10 +831,20 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_model_uses_env_or_auto() {
-        assert_eq!(openrouter_model(None), "openrouter/auto");
-        assert_eq!(openrouter_model(Some("")), "openrouter/auto");
-        assert_eq!(openrouter_model(Some("vendor/model")), "vendor/model");
+    fn role_model_picks_env_over_role_default() {
+        let dev = e4a_harness::dev_agent().model;
+        assert_eq!(role_model(None, None, dev), dev);
+        assert_eq!(role_model(Some(""), None, dev), dev);
+        assert_eq!(role_model(None, Some(""), dev), dev);
+        assert_eq!(role_model(None, Some("vendor/dev"), dev), "vendor/dev");
+        assert_eq!(
+            role_model(Some("vendor/global"), Some("vendor/dev"), dev),
+            "vendor/global"
+        );
+        assert_eq!(
+            role_model(Some("openrouter/auto"), None, dev),
+            "openrouter/auto"
+        );
     }
 
     #[test]

@@ -46,6 +46,7 @@ async fn resume_runs_the_waiting_powershell_and_the_next_request_sees_it() {
         output_tokens: 1,
         provider: "faux".into(),
         model: "scripted".into(),
+        cost_usd: 0.0,
     }).with_tool_call(ToolCall {
         id: "c1".into(),
         name: "powershell".into(),

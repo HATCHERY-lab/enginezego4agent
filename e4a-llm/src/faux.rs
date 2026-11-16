@@ -24,6 +24,7 @@ impl Script {
                 output_tokens: 0,
                 provider: "faux".into(),
                 model: "scripted".into(),
+                cost_usd: 0.0,
             },
             fail: None,
         }

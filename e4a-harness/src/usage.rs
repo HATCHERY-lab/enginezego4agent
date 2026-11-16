@@ -57,9 +57,14 @@ fn merged_bucket(current: &Json, key: &str, usage: &Usage) -> Json {
         .and_then(Json::as_i64)
         .unwrap_or(0)
         .saturating_add(usage.output_tokens);
+    let cost = previous
+        .and_then(|bucket| bucket.get("cost"))
+        .and_then(Json::as_f64)
+        .unwrap_or(0.0)
+        + usage.cost_usd;
     json!({
         "input": input,
         "output": output,
-        "cost": 0
+        "cost": (cost * 1e6).round() / 1e6
     })
 }

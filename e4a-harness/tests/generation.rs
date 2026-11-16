@@ -12,6 +12,7 @@ fn usage(input: i64, output: i64) -> Usage {
         output_tokens: output,
         provider: "faux".into(),
         model: "scripted".into(),
+        cost_usd: 0.0,
     }
 }
 

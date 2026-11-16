@@ -59,12 +59,16 @@ pub struct ToolCall {
 }
 
 /// Token counts for one turn. Cost is recorded by the harness; faux turns use zero.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub provider: String,
     pub model: String,
+    /// What the provider charged for the turn, US dollars. OpenRouter reports
+    /// it per turn; a faux turn or a provider without prices carries 0.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Events a streamed turn yields. HTTP frames never cross this type.

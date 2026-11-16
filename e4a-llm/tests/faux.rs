@@ -36,6 +36,7 @@ async fn faux_replays_text_tool_call_and_usage() {
         output_tokens: 7,
         provider: "faux".into(),
         model: "scripted".into(),
+        cost_usd: 0.0,
     };
     let llm = FauxLlm::text("hello")
         .with_tool_call(ToolCall {

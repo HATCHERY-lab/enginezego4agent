@@ -576,7 +576,7 @@ where
     let bytes = read_http_body(&mut io, &head).await?;
     if !(200..300).contains(&head.status) {
         let text = String::from_utf8_lossy(&bytes);
-        return Err(public_error(head.status, &text, key));
+        return Err(public_error(&head, &text, key));
     }
     String::from_utf8(bytes).map_err(|_| Error::message("openrouter response is not utf-8"))
 }
@@ -782,12 +782,41 @@ fn find_crlf(input: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-fn public_error(status: u16, body: &str, key: &str) -> Error {
+/// The error a non-2xx response becomes. A 429 says "rate limited" and carries
+/// the `X-RateLimit-*` counters when the response has them, so a caller can
+/// pick a fallback model without parsing prose.
+fn public_error(head: &ResponseHead, body: &str, key: &str) -> Error {
     let detail = truncate(&redact(&error_snippet(body), key), 300);
-    if detail.is_empty() {
-        Error::message(format!("openrouter status {status}"))
+    let prefix = if head.status == 429 {
+        rate_limit_note(head).unwrap_or_else(|| "openrouter rate limited".into())
     } else {
-        Error::message(format!("openrouter status {status}: {detail}"))
+        format!("openrouter status {}", head.status)
+    };
+    if detail.is_empty() {
+        Error::message(prefix)
+    } else {
+        Error::message(format!("{prefix}: {detail}"))
+    }
+}
+
+/// `requests left N, tokens left M, resets DATE` from the rate-limit headers.
+fn rate_limit_note(head: &ResponseHead) -> Option<String> {
+    let mut parts = Vec::new();
+    for (header, label) in [
+        ("x-ratelimit-requests-remaining", "requests left"),
+        ("x-ratelimit-tokens-remaining", "tokens left"),
+    ] {
+        if let Some(value) = head.header(header) {
+            parts.push(format!("{label} {value}"));
+        }
+    }
+    if let Some(reset) = head.header("x-ratelimit-reset") {
+        parts.push(format!("resets {reset}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("openrouter rate limited ({})", parts.join(", ")))
     }
 }
 
@@ -833,7 +862,7 @@ struct PartialCall {
 struct Accum {
     text: String,
     calls: BTreeMap<u32, PartialCall>,
-    usage: Option<(i64, i64)>,
+    usage: Option<(i64, i64, f64)>,
     reported_model: String,
     finish: Option<String>,
 }
@@ -1026,10 +1055,16 @@ fn absorb_one_call(accum: &mut Accum, index: u32, call: &Value) -> Result<(), Er
     Ok(())
 }
 
-fn parse_usage(value: &Value) -> Result<(i64, i64), Error> {
+fn parse_usage(value: &Value) -> Result<(i64, i64, f64), Error> {
+    let cost = value
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .unwrap_or(0.0);
     Ok((
         token_count(value, &["prompt_tokens", "input_tokens"])?,
         token_count(value, &["completion_tokens", "output_tokens"])?,
+        cost,
     ))
 }
 
@@ -1091,7 +1126,7 @@ fn finish_accum(accum: Accum, configured_model: &str) -> Result<Vec<LlmEvent>, E
     if events.is_empty() {
         return Err(Error::message("model turn was empty"));
     }
-    let Some((input_tokens, output_tokens)) = accum.usage else {
+    let Some((input_tokens, output_tokens, cost_usd)) = accum.usage else {
         return Err(Error::message("model turn did not report usage"));
     };
     let model = if accum.reported_model.is_empty() {
@@ -1104,6 +1139,7 @@ fn finish_accum(accum: Accum, configured_model: &str) -> Result<Vec<LlmEvent>, E
         output_tokens,
         provider: "openrouter".into(),
         model,
+        cost_usd,
     }));
     Ok(events)
 }
@@ -1214,6 +1250,7 @@ data: [DONE]\n";
                     output_tokens: 5,
                     provider: "openrouter".into(),
                     model: "vendor/model".into(),
+                    cost_usd: 0.0,
                 }),
             ]
         );
@@ -1252,9 +1289,41 @@ data: [DONE]\n";
     #[test]
     fn status_error_drops_the_bearer_token() {
         let key = "test-token-value";
-        let err = public_error(401, &format!("{{\"error\":{{\"message\":\"bad {key}\"}}}}"), key);
+        let head = parse_head("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n").unwrap();
+        let err = public_error(&head, &format!("{{\"error\":{{\"message\":\"bad {key}\"}}}}"), key);
         assert!(!err.to_string().contains(key));
         assert!(err.to_string().contains("[redacted]"));
         assert!(err.to_string().starts_with("openrouter status 401"));
+    }
+
+    #[test]
+    fn a_429_names_the_rate_limit_and_its_counters() {
+        let raw = "HTTP/1.1 429 Too Many Requests\r\n\
+X-RateLimit-Requests-Remaining: 0\r\n\
+X-RateLimit-Tokens-Remaining: 12\r\n\
+X-RateLimit-Reset: 2026-11-17T00:00:00.000Z\r\n\r\n";
+        let head = parse_head(raw).unwrap();
+        let err = public_error(&head, "{\"error\":{\"message\":\"free-model limit\"}}", "k");
+        let text = err.to_string();
+        assert!(text.starts_with("openrouter rate limited (requests left 0, tokens left 12"), "{text}");
+        assert!(text.contains("resets 2026-11-17"), "{text}");
+        assert!(text.contains("free-model limit"), "{text}");
+    }
+
+    #[test]
+    fn a_429_without_headers_still_names_the_limit() {
+        let head = parse_head("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n").unwrap();
+        let err = public_error(&head, "", "k");
+        assert_eq!(err.to_string(), "openrouter rate limited");
+    }
+
+    #[test]
+    fn usage_carries_the_reported_cost() {
+        let body = "data: {\"model\":\"vendor/model\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"cost\":0.0000031}}\n\ndata: [DONE]\n";
+        let events = events_from_body(body, "configured").unwrap();
+        let LlmEvent::Usage(usage) = events.last().unwrap() else {
+            panic!("no usage event");
+        };
+        assert_eq!(usage.cost_usd, 0.0000031);
     }
 }
