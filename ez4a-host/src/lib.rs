@@ -344,6 +344,24 @@ async fn memory_prompt(
         return Err(err);
     }
     let answered = turn_text(&session, llm, user_text, root).await;
+    // Cadence, omp's reviewMode=turn: once a turn answers, the advisor branch
+    // reviews its delta — but only when its own model is named. Best effort: a
+    // failed review never fails the turn.
+    if answered.is_ok() {
+        if let Ok(model) = std::env::var("EZ4A_ADVISOR_MODEL") {
+            if !model.trim().is_empty() {
+                let advisor = ez4a_llm::OpenRouterClient::new(model.trim().to_string());
+                if let Ok(workspace) = ez4a_tools::Workspace::new(root) {
+                    if let Err(err) =
+                        ez4a_tools::review(&session, &advisor, &workspace, ez4a_session::ROOT_CONVERSATION_ID)
+                            .await
+                    {
+                        eprintln!("advisor review failed: {err}");
+                    }
+                }
+            }
+        }
+    }
     let released = shutdown(&mut sessions, "ez4a");
     // A missed release outranks the turn and the journal close. The turn outranks close.
     let shutdown_err = if released == vec![provider.to_string()] {

@@ -201,10 +201,13 @@ async fn ask_advisor<L: Llm>(
         ChatMessage {
             role: "system".into(),
             text: format!(
-                "{} Review the worker transcript delta below. Call advise(note, severity) \
-with severity nit, concern, or blocker for every real problem you see in what the \
-worker did. No praise, no summaries, no restating the work. If nothing is wrong, \
-call advise with a one-word note \"none\". You may read one file first.",
+                "{} You review another agent's work. That worker has file and shell \
+tools of its own; you do not judge what tools exist, only what the worker did \
+with them. Review the worker transcript delta below. Call advise(note, severity) \
+with severity nit, concern, or blocker for every real problem in the work: \
+wrong content, a broken command, a wrong path, a step that cannot achieve the \
+user's request. No praise, no summaries, no restating the work. If nothing is \
+wrong, call advise with the one-word note \"none\". You may read one file first.",
                 role.instructions
             ),
             tool_calls: Vec::new(),
