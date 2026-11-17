@@ -14,7 +14,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Ok(ez4a_host::Command::Run { root, prompt }) => {
+        Ok(ez4a_host::Command::Run { root, prompt, role }) => {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -25,7 +25,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            match runtime.block_on(ez4a_host::run_turn(&root, &prompt)) {
+            match runtime.block_on(ez4a_host::run_turn(&root, &prompt, &role)) {
                 Ok(answer) => {
                     println!("{answer}");
                     ExitCode::SUCCESS

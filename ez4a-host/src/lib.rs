@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 pub enum Command {
     /// Serve ACP on stdin and stdout.
     Acp,
-    /// One worker turn in its own root; the answer goes to stdout.
-    Run { root: String, prompt: String },
+    /// One hired-role turn in its own root; the answer goes to stdout.
+    Run { root: String, prompt: String, role: String },
     /// Print [`USAGE`] and exit successfully.
     Help,
 }
@@ -61,6 +61,7 @@ where
 fn parse_run(args: &[String]) -> Result<Command, ()> {
     let mut root = None;
     let mut prompt = None;
+    let mut role = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -72,12 +73,17 @@ fn parse_run(args: &[String]) -> Result<Command, ()> {
                 prompt = args.get(index + 1).cloned();
                 index += 2;
             }
+            "--role" => {
+                role = args.get(index + 1).cloned();
+                index += 2;
+            }
             _ => return Err(()),
         }
     }
     Ok(Command::Run {
         root: root.ok_or(())?,
         prompt: prompt.ok_or(())?,
+        role: role.unwrap_or_else(|| "dev".into()),
     })
 }
 
@@ -465,6 +471,78 @@ fn redact_key(message: &str, key: &str) -> String {
 
 /// Filesystem and shell tools match `ez4a-tools` `examples/live.rs`.
 /// `code` and `resize` are offered here as well.
+/// The full schema table: worker tools plus the agent, mail, and door tools
+/// a role may be granted. Names a role lists and the table lacks are dropped.
+fn tools_for(names: &[String]) -> Vec<ToolSchema> {
+    let mut table = offered_tools();
+    table.extend(roster_tools());
+    names
+        .iter()
+        .filter_map(|name| table.iter().find(|schema| &schema.name == name))
+        .cloned()
+        .collect()
+}
+
+/// Schemas the roster grants beyond the worker set: spawning, mail, the node
+/// door.
+fn roster_tools() -> Vec<ToolSchema> {
+    vec![
+        schema(
+            "agent",
+            "Spawn one worker agent with a self-contained prompt. It runs with the worker tool set (it cannot spawn agents) in its own workspace under subagents/. Its final answer comes back as the tool result.",
+            json!({
+                "type":"object",
+                "properties":{"prompt":{"type":"string"}},
+                "required":["prompt"]
+            }),
+        ),
+        schema(
+            "mail_send",
+            "Send mail through hatchery's mail4agent. to is an account, a session address, or #room.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "to":{"type":"string"},
+                    "subject":{"type":"string"},
+                    "body":{"type":"string"},
+                    "reply_to":{"type":"string"}
+                },
+                "required":["to","subject","body"]
+            }),
+        ),
+        schema(
+            "mail_inbox",
+            "Read your mail. wait_secs parks the read for new mail (max 60).",
+            json!({
+                "type":"object",
+                "properties":{"wait_secs":{"type":"integer"}}
+            }),
+        ),
+        schema(
+            "mail_whoami",
+            "Your own mail address and card.",
+            json!({"type":"object","properties":{}}),
+        ),
+        schema(
+            "g4a_tasks",
+            "List open tasks assigned to this machine.",
+            json!({"type":"object","properties":{}}),
+        ),
+        schema(
+            "g4a_task_update",
+            "Set the state of one of your tasks (in_progress or done).",
+            json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "status":{"type":"string","enum":["in_progress","done"]}
+                },
+                "required":["id","status"]
+            }),
+        ),
+    ]
+}
+
 fn offered_tools() -> Vec<ToolSchema> {
     vec![
         schema(
@@ -571,12 +649,23 @@ fn schema(name: &str, description: &str, parameters: Value) -> ToolSchema {
 /// is the dev role's, resolved through `EZ4A_MODEL` / `EZ4A_DEV_MODEL`. The
 /// worker tool set is [`offered_tools`]: no `agent` — a worker does not spawn
 /// workers. The answer's text is the return value.
-pub async fn run_turn(root: &str, prompt: &str) -> Result<String, String> {
+pub async fn run_turn(root: &str, prompt: &str, role_id: &str) -> Result<String, String> {
     let session = open_journal(root).await?;
     let workspace = ez4a_tools::Workspace::new(root).map_err(|err| err.to_string())?;
+    let catalog = {
+        let dir = std::env::var("EZ4A_ROLES_DIR").unwrap_or_default();
+        let dir = if dir.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(dir))
+        };
+        ez4a_harness::load(dir.as_deref())
+    };
+    let role = ez4a_harness::find(&catalog, role_id)
+        .ok_or_else(|| format!("unknown role {role_id}"))?;
     let model = role_model(
         std::env::var("EZ4A_MODEL").ok().as_deref(),
-        std::env::var("EZ4A_DEV_MODEL").ok().as_deref(),
+        Some(role.model.as_str()),
         ez4a_harness::dev_agent().model,
     );
     let llm = ez4a_llm::OpenRouterClient::new(model);
@@ -585,8 +674,8 @@ pub async fn run_turn(root: &str, prompt: &str) -> Result<String, String> {
         .map_err(|err| err.to_string())?;
     let input = ez4a_harness::TurnInput {
         conversation_id: ez4a_session::ROOT_CONVERSATION_ID,
-        user_text: prompt.to_string(),
-        tools: offered_tools(),
+        user_text: role.prompt_for(prompt),
+        tools: tools_for(&role.tools),
     };
     let outcome = ez4a_tools::run_until_answer_in(&session, &llm, &workspace, &input, root)
         .await
@@ -1049,14 +1138,16 @@ mod tests {
             parse_args(["run", "--root", "E:/dir", "--prompt", "do it"]),
             Ok(Command::Run {
                 root: "E:/dir".into(),
-                prompt: "do it".into()
+                prompt: "do it".into(),
+                role: "dev".into()
             })
         );
         assert_eq!(
-            parse_args(["run", "--prompt", "do it", "--root", "E:/dir"]),
+            parse_args(["run", "--prompt", "do it", "--role", "reviewer", "--root", "E:/dir"]),
             Ok(Command::Run {
                 root: "E:/dir".into(),
-                prompt: "do it".into()
+                prompt: "do it".into(),
+                role: "reviewer".into()
             })
         );
         assert!(parse_args(["run"]).is_err());
