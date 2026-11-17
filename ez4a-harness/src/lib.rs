@@ -34,6 +34,7 @@ mod registry;
 mod role_catalog;
 mod run_state;
 mod scheduler;
+mod shepherd;
 mod scheduler_drive;
 mod scheduler_js;
 mod search;
@@ -103,6 +104,7 @@ pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
 pub use registry::Registry;
 pub use role_catalog::{find, load, builtin, RoleDef};
+pub use shepherd::{decide as decide_directive, flock, ApprovalVerdict, Order, Policy};
 pub use run_state::{
     advance, blocked_reason, blocked_subject, ended_by_crashes, next_attempt, BlockedReason,
     BlockedSubject, Invocation, RegisteredDefinition, RunEvent, RunPhase,
