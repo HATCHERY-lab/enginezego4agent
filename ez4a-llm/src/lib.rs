@@ -1,10 +1,12 @@
 //! Model turns. [`Llm`] yields text, tool-call, and usage events.
 //! [`OpenRouterClient`] is the only caller that speaks HTTPS, and only after SOCKS5.
 
+mod budget;
 mod faux;
 mod openrouter;
 
 pub use faux::FauxLlm;
+pub use budget::{charge, check};
 pub use openrouter::OpenRouterClient;
 
 use std::future::Future;
