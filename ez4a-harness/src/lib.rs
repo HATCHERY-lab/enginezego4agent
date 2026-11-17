@@ -26,6 +26,7 @@ mod live_run;
 mod notify_pass;
 mod open_opts;
 mod overlay;
+mod overseer;
 mod partial;
 mod prompt;
 mod provider;
@@ -96,6 +97,7 @@ pub use open_opts::{
     DEFAULT_RESTART_LIMIT,
 };
 pub use overlay::{after_tool, Overlay};
+pub use overseer::{Action, Directive, Kind, Observation, Overseer, OverseerConfig, SessionId};
 pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
