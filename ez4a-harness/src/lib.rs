@@ -1,5 +1,6 @@
 //! Generation harness. The model call sits between commits and does not hold the store writer.
 
+mod admin_agent;
 mod advisor;
 mod advisor_agent;
 mod broker;
@@ -68,6 +69,7 @@ mod advisor_turn;
 mod view_follow;
 mod gate_board;
 
+pub use admin_agent::{admin_agent, ADMIN_INSTRUCTIONS};
 pub use advisor::advisor_tools;
 pub use advisor_agent::{advisor_agent, advisor_fallback};
 pub use broker::{broker, KeyBroker};
