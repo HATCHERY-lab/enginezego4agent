@@ -1,0 +1,20 @@
+[package]
+name = "ez4a-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ACP stdio host for engine zero for agents"
+publish = false
+autobins = false
+
+[[bin]]
+name = "ez4a"
+path = "src/main.rs"
+
+[dependencies]
+ez4a-harness = { path = "../ez4a-harness" }
+ez4a-llm = { path = "../ez4a-llm" }
+ez4a-session = { path = "../ez4a-session" }
+ez4a-tools = { path = "../ez4a-tools" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }

@@ -1,0 +1,13 @@
+[package]
+name = "ez4a-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Memory and SQLite durable storage for engine zero for agents"
+publish = false
+
+[dependencies]
+ez4a-types = { path = "../ez4a-types" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+thiserror = "1"
