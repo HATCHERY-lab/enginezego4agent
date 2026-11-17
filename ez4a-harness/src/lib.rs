@@ -33,6 +33,7 @@ mod overseer;
 mod partial;
 mod prompt;
 mod provider;
+mod peer_book;
 mod provider_caps;
 mod registry;
 mod role_catalog;
@@ -109,6 +110,7 @@ pub use overseer::{Action, Directive, Kind, Observation, Overseer, OverseerConfi
 pub use partial::{push_delta, PartialText};
 pub use prompt::{plan_system_entries, replay_sections, Section};
 pub use provider::ensure_provider_session_id;
+pub use peer_book::{Peer, PeerBook};
 pub use provider_caps::{wire_for, ProviderCaps, WireAction};
 pub use registry::Registry;
 pub use role_catalog::{find, load, builtin, RoleDef};
