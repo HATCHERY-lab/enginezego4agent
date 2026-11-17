@@ -14,6 +14,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(ez4a_host::Command::Mcp) => match ez4a_host::serve_mcp_sync() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(1)
+            }
+        },
         Ok(ez4a_host::Command::Run { root, prompt, role }) => {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()

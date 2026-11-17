@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 pub enum Command {
     /// Serve ACP on stdin and stdout.
     Acp,
+    /// Serve MCP on stdin and stdout: the roster's handles.
+    Mcp,
     /// One hired-role turn in its own root; the answer goes to stdout.
     Run { root: String, prompt: String, role: String },
     /// Print [`USAGE`] and exit successfully.
@@ -31,12 +33,14 @@ pub enum Command {
 }
 
 /// Usage text for help, no arguments, and unknown arguments.
-pub const USAGE: &str = "usage: ez4a acp | ez4a run --root <dir> --prompt <text>\n";
+pub const USAGE: &str = "usage: ez4a acp | ez4a mcp | ez4a run --root <dir> --prompt <text>\n";
 
 /// Parse arguments after the program name.
 ///
 /// [`Command::Acp`] and help are the only accepted forms. Anything else,
 /// including no arguments, is [`Err`] so the process can exit 2.
+pub mod mcp;
+
 pub fn parse_args<I, S>(args: I) -> Result<Command, ()>
 where
     I: IntoIterator<Item = S>,
@@ -51,6 +55,7 @@ where
     };
     match first.as_str() {
         "acp" if args.len() == 1 => Ok(Command::Acp),
+        "mcp" if args.len() == 1 => Ok(Command::Mcp),
         "run" => parse_run(&args[1..]),
         "help" | "--help" | "-h" if args.len() == 1 => Ok(Command::Help),
         _ => Err(()),
@@ -689,6 +694,43 @@ pub async fn run_turn(root: &str, prompt: &str, role_id: &str) -> Result<String,
         .map_err(|err| err.to_string())?
         .ok_or_else(|| format!("assistant entry {entry_id} is missing"))?;
     entry_text(&entry)
+}
+
+/// Serve the MCP door on stdin/stdout: one JSON-RPC line in, one line out.
+/// The model is the advisor role's; without the door's envs every tools/call
+/// says so as a tool result, not a crash.
+pub fn serve_mcp_sync() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let model = role_model(
+        std::env::var("EZ4A_MODEL").ok().as_deref(),
+        std::env::var("EZ4A_ADVISOR_MODEL").ok().as_deref(),
+        ez4a_harness::advisor_agent().model,
+    );
+    let llm = ez4a_llm::OpenRouterClient::new(model);
+    runtime.block_on(async {
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        let mut stdout = std::io::stdout().lock();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match mcp::handle_request_with(&line, &llm).await {
+                Ok(Some(reply)) => {
+                    let _ = writeln!(stdout, "{reply}");
+                    let _ = stdout.flush();
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("{err}"),
+            }
+        }
+        Ok::<(), String>(())
+    })?;
+    Ok(())
 }
 
 fn entry_text(entry: &EntryRecord) -> Result<String, String> {
