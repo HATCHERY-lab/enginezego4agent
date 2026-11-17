@@ -89,6 +89,7 @@ async fn stream_turn(
         "EZ4A_OPENROUTER_KEY is unset",
     )?;
     validate_key(&key)?;
+    crate::budget::check(&model)?;
     let body = chat_body(&model, &request)?;
     let bytes = serde_json::to_vec(&body).map_err(|err| Error::message(format!("chat request: {err}")))?;
     let text = match exchange(&endpoint, &key, &bytes).await {
@@ -97,6 +98,13 @@ async fn stream_turn(
     };
     let events = events_from_body(&text, &model)
         .map_err(|err| Error::message(redact(&err.to_string(), &key)))?;
+    if let Some(LlmEvent::Usage(usage)) = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, LlmEvent::Usage(_)))
+    {
+        crate::budget::charge(&model, usage.cost_usd);
+    }
     Ok(EventStream::from_events(events))
 }
 
