@@ -1,6 +1,6 @@
 [package]
 name = "ez4a-store"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "Memory and SQLite durable storage for engine zero for agents"
