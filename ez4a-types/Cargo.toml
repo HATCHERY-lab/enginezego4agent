@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Durable Pi storage records for engine zero for agents"
-publish = false
+repository = "https://github.com/HATCHERY-lab/ez4a"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
