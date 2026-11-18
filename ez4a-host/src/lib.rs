@@ -22,6 +22,8 @@ use serde_json::{json, Value};
 /// Subcommand of `ez4a`: serve ACP, run one worker turn, or print help.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Print the version and exit 0 (the kit contract: every provider CLI answers --version).
+    Version,
     /// Serve ACP on stdin and stdout.
     Acp,
     /// Serve MCP on stdin and stdout: the roster's handles.
@@ -58,6 +60,7 @@ where
         "mcp" if args.len() == 1 => Ok(Command::Mcp),
         "run" => parse_run(&args[1..]),
         "help" | "--help" | "-h" if args.len() == 1 => Ok(Command::Help),
+        "--version" | "-V" | "version" if args.len() == 1 => Ok(Command::Version),
         _ => Err(()),
     }
 }

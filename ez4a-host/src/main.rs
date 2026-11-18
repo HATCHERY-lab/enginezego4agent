@@ -3,6 +3,10 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match ez4a_host::parse_args(std::env::args().skip(1)) {
+        Ok(ez4a_host::Command::Version) => {
+            println!("ez4a {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Ok(ez4a_host::Command::Help) => {
             print!("{}", ez4a_host::USAGE);
             ExitCode::SUCCESS
